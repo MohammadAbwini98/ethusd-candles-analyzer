@@ -1,0 +1,155 @@
+# Data source: "capital_api" (fetch from Capital.com) or "db_table" (read external table)
+data_source: capital_api
+
+# Capital.com API credentials & settings
+capital:
+  api_key: "YOUR_CAPITAL_API_KEY"
+  email: "your@email.com"
+  password: "YOUR_PASSWORD"
+  base_url: https://api-capital.backend-capital.com
+  epic: ETHUSD
+  backfill_enabled: true   # set to false to skip historical backfill on startup
+  # Live polling intervals (seconds)
+  tick_poll_seconds: 1
+  sentiment_poll_seconds: 30
+
+db:
+  host: localhost
+  port: 5432
+  database: goldbot
+  username: YOUR_DB_USER
+  password: ""   # no password required
+
+# Legacy table (used when data_source=db_table)
+table: candles
+
+filters:
+  epic: ETHUSD
+
+# Column mapping (matches both legacy and new ethusd_analytics.candles table)
+columns:
+  time: ts
+  close: close
+  vol: vol
+  buyers_pct: buyers_pct
+  sellers_pct: sellers_pct
+  epic: epic
+
+stream:
+  poll_seconds: 10
+  history_hours: 720
+  max_bars: 20000
+  save_every_seconds: 60
+
+analysis:
+  z_window: 50
+  rolling_corr_windows: [20, 50]
+  lag_range: 12
+  forward_horizons: [1, 2]
+  resample_timeframes: ["5min", "15min", "30min"]
+
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8787
+  open_browser: true
+  refresh_seconds: 2
+
+db_output:
+  enabled: true
+  schema: ethusd_analytics
+  store_rolling_points: 500
+  retain_days: 14
+  enable_perf_tables: false   # FR-29: set true to create strategy_runs/trades/equity tables
+
+strategy:
+  enabled: true
+  timeframes: ["1m", "5m", "15m", "30m"]
+  cooldown_bars: 3
+  symbol: ETHUSD      # FR-26
+  regime:
+    mom_span: 20
+    vol_window: 20
+    regime_corr_window: 50
+    r_min: 0.10
+    a_min: 0.10
+    # FR-09: K-of-M regime persistence (set persistence_m > 1 to enable)
+    persistence_k: 2    # minimum occurrences required
+    persistence_m: 3    # rolling window size
+  signal:
+    quantile_window: 200
+    quantile_hi: 0.90
+    quantile_lo: 0.10
+    mom_k: 1.5
+  calibration:
+    enabled: true
+    interval_minutes: 60
+    lookback_days: 30
+    cost_bps: 10
+    min_trades: 20
+    max_drawdown: 0.15
+    walk_forward_folds: 1    # FR-22: set > 1 to enable rolling walk-forward (e.g. 3 or 5)
+    grid:
+      r_min: [0.05, 0.10, 0.15]
+      quantile_window: [150, 200, 300]
+      quantile_levels: [[0.85, 0.15], [0.90, 0.10], [0.95, 0.05]]
+      hold_bars: [1, 2, 3]
+      cost_bps: [5, 10, 15]
+    # FR-18: per-timeframe calibration overrides (override TF-aware code defaults if set)
+    # NOTE: TF-aware defaults already embedded in run_calibration():
+    #   min_trades: 1m=80, 5m=30, 15m=15, 30m=8
+    #   max_drawdown: 1m=0.15, 5m=0.15, 15m=0.18, 30m=0.20
+    # These per_timeframe entries override those defaults. Remove or comment to use code defaults.
+    per_timeframe:
+      1m:
+        min_trades: 80
+        max_drawdown: 1.50    # cumulative equity-curve DD; scales with ~1800 trades/lookback
+        lookback_days: 7
+      5m:
+        min_trades: 30
+        max_drawdown: 0.30
+        lookback_days: 14
+      15m:
+        min_trades: 15
+        max_drawdown: 0.18
+        lookback_days: 21
+      30m:
+        min_trades: 8
+        max_drawdown: 0.20
+        lookback_days: 30
+  # FR-14: per-timeframe signal threshold overrides
+  timeframe_overrides:
+    1m:
+      signal:
+        mom_k: 2.0
+    30m:
+      confidence:
+        min_confidence: 0.60
+  tp_sl:
+    mr_tp_mult: 1.0
+    mr_sl_mult: 1.2
+    mom_tp_mult: 2.0
+    mom_sl_mult: 1.0
+  confidence:
+    min_confidence: 0.55
+    weight_regime: 0.5
+    weight_tail: 0.3
+    weight_backtest: 0.2
+    regime_denom: 0.25
+
+alerts:
+  enabled: true
+  whatsapp_notifier_url: "http://127.0.0.1:3099/send"
+  wa_number: "YOUR_WHATSAPP_NUMBER"   # e.g. 962789200300 (country code + digits, no leading +)
+  timeout_seconds: 3
+  events:
+    signal_fired: true
+    calibration_warning: true
+    sanity_check_fail: true
+    daily_summary: true
+    system_error: true
+  rate_limit:
+    enabled: true
+    window_seconds: 60
+    max_per_window: 10
+  daily_summary_hour_utc: 21   # UTC hour to emit daily P&L digest (e.g. 21 = 00:00 Jordan time)

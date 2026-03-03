@@ -1,0 +1,1365 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ETHUSD Dashboard</title>
+  <style>
+    /* ── Reset & Base ──────────────────────────────── */
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #181b24;
+      --surface2: #1e222d;
+      --border: #2a2e3a;
+      --text: #e1e4ea;
+      --muted: #7b8194;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59, 130, 246, .15);
+      --green: #22c55e;
+      --green-bg: rgba(34, 197, 94, .12);
+      --green-border: rgba(34, 197, 94, .25);
+      --red: #ef4444;
+      --red-bg: rgba(239, 68, 68, .12);
+      --red-border: rgba(239, 68, 68, .25);
+      --yellow: #eab308;
+      --yellow-bg: rgba(234, 179, 8, .10);
+      --yellow-border: rgba(234, 179, 8, .25);
+      --blue: #60a5fa;
+      --blue-bg: rgba(96, 165, 250, .10);
+      --blue-border: rgba(96, 165, 250, .25);
+      --radius: 10px;
+      --radius-sm: 6px;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --shadow: 0 1px 3px rgba(0, 0, 0, .3), 0 1px 2px rgba(0, 0, 0, .2);
+      --shadow-lg: 0 4px 16px rgba(0, 0, 0, .4);
+    }
+
+    html {
+      font-size: 14px
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh
+    }
+
+    /* ── Top Bar ───────────────────────────────────── */
+    .topbar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+
+    .topbar h1 {
+      font-size: 16px;
+      font-weight: 700;
+      white-space: nowrap
+    }
+
+    .price-block {
+      display: flex;
+      align-items: baseline;
+      gap: 8px
+    }
+
+    #priceDisplay {
+      font-family: var(--mono);
+      font-size: 26px;
+      font-weight: 700;
+      transition: color .3s;
+      letter-spacing: -.5px;
+    }
+
+    #priceSpread {
+      font-size: 11px;
+      color: var(--muted)
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-left: auto
+    }
+
+    .controls select {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 5px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      outline: none;
+      transition: border-color .2s;
+    }
+
+    .controls select:hover {
+      border-color: var(--accent)
+    }
+
+    .controls select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-glow)
+    }
+
+    .btn {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 5px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all .2s;
+    }
+
+    .btn:hover {
+      background: var(--border);
+      border-color: var(--muted)
+    }
+
+    .btn:active {
+      transform: scale(.97)
+    }
+
+    /* ── Pills ──────────────────────────────────────── */
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .3px;
+      text-transform: uppercase;
+      background: var(--surface2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      transition: all .3s;
+    }
+
+    .pill.ok {
+      background: var(--green-bg);
+      color: var(--green);
+      border-color: var(--green-border)
+    }
+
+    .pill.bad {
+      background: var(--red-bg);
+      color: var(--red);
+      border-color: var(--red-border)
+    }
+
+    .pill.buy {
+      background: var(--green-bg);
+      color: var(--green);
+      border-color: var(--green-border)
+    }
+
+    .pill.sell {
+      background: var(--red-bg);
+      color: var(--red);
+      border-color: var(--red-border)
+    }
+
+    .pill.mr {
+      background: var(--blue-bg);
+      color: var(--blue);
+      border-color: var(--blue-border)
+    }
+
+    .pill.mom {
+      background: var(--yellow-bg);
+      color: var(--yellow);
+      border-color: var(--yellow-border)
+    }
+
+    .pill.warn {
+      background: var(--yellow-bg);
+      color: var(--yellow);
+      border-color: var(--yellow-border)
+    }
+
+    .pill.expired {
+      background: var(--red-bg);
+      color: var(--red);
+      border-color: var(--red-border);
+      opacity: .7
+    }
+
+    .pill.active {
+      background: var(--green-bg);
+      color: var(--green);
+      border-color: var(--green-border)
+    }
+
+    /* ── Loader Spinner ─────────────────────────────── */
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+
+    /* ── Layout ─────────────────────────────────────── */
+    .container {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 16px 20px
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 14px
+    }
+
+    @media(max-width:1100px) {
+
+      .grid-2,
+      .grid-3 {
+        grid-template-columns: 1fr
+      }
+    }
+
+    .full-width {
+      grid-column: 1/-1
+    }
+
+    /* ── Cards ──────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: border-color .2s, box-shadow .2s;
+    }
+
+    .card:hover {
+      border-color: rgba(59, 130, 246, .3);
+      box-shadow: 0 0 0 1px var(--accent-glow)
+    }
+
+    .card-header {
+      padding: 12px 16px 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .card-header h3 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--muted)
+    }
+
+    .card-body {
+      padding: 12px 16px 14px
+    }
+
+    .card-body.no-pad {
+      padding: 0
+    }
+
+    /* ── Key-Value Tables ───────────────────────────── */
+    .kv-table {
+      width: 100%;
+      border-collapse: collapse
+    }
+
+    .kv-table tr {
+      border-bottom: 1px solid var(--border)
+    }
+
+    .kv-table tr:last-child {
+      border-bottom: none
+    }
+
+    .kv-table td {
+      padding: 6px 10px;
+      font-size: 12px;
+      vertical-align: top
+    }
+
+    .kv-table td:first-child {
+      color: var(--muted);
+      width: 40%;
+      white-space: nowrap;
+      font-weight: 500
+    }
+
+    .kv-table td:last-child {
+      font-family: var(--mono);
+      color: var(--text);
+      word-break: break-all
+    }
+
+    /* ── Data Tables ────────────────────────────────── */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px
+    }
+
+    .data-table th {
+      background: var(--surface2);
+      color: var(--muted);
+      padding: 7px 8px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      position: sticky;
+      top: 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .data-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text)
+    }
+
+    .data-table tbody tr {
+      transition: background .15s
+    }
+
+    .data-table tbody tr:hover {
+      background: var(--surface2)
+    }
+
+    .scroll-box {
+      max-height: 400px;
+      overflow: auto
+    }
+
+    .scroll-box::-webkit-scrollbar {
+      width: 6px
+    }
+
+    .scroll-box::-webkit-scrollbar-track {
+      background: var(--surface)
+    }
+
+    .scroll-box::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 3px
+    }
+
+    .scroll-box::-webkit-scrollbar-thumb:hover {
+      background: var(--muted)
+    }
+
+    /* ── Signal Card Special ────────────────────────── */
+    .signal-hero {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    .signal-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+
+    .signal-metric {
+      background: var(--surface2);
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+    }
+
+    .signal-metric .label {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .3px;
+      margin-bottom: 2px
+    }
+
+    .signal-metric .value {
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 600
+    }
+
+    .signal-reason {
+      margin-top: 8px;
+      padding: 6px 10px;
+      background: var(--surface2);
+      border-radius: var(--radius-sm);
+      font-size: 11px;
+      color: var(--muted);
+      border-left: 3px solid var(--accent);
+    }
+
+    .no-signal-msg {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 20px 0;
+      text-align: center
+    }
+
+    /* ── Calibration Warning ────────────────────────── */
+    .cal-warn {
+      background: var(--yellow-bg);
+      border: 1px solid var(--yellow-border);
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--yellow);
+    }
+
+    /* ── Notes Card ─────────────────────────────────── */
+    .notes-list {
+      list-style: none;
+      padding: 0
+    }
+
+    .notes-list li {
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted);
+      padding-left: 16px;
+      position: relative;
+    }
+
+    .notes-list li:last-child {
+      border-bottom: none
+    }
+
+    .notes-list li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 12px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent)
+    }
+
+    /* ── Fade-in Animation ──────────────────────────── */
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+        transform: translateY(6px)
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0)
+      }
+    }
+
+    .fade-in {
+      animation: fadeIn .35s ease-out
+    }
+
+    /* ── Pulse for price ────────────────────────────── */
+    @keyframes pulseGreen {
+      0% {
+        text-shadow: 0 0 8px rgba(34, 197, 94, .6)
+      }
+
+      100% {
+        text-shadow: none
+      }
+    }
+
+    @keyframes pulseRed {
+      0% {
+        text-shadow: 0 0 8px rgba(239, 68, 68, .6)
+      }
+
+      100% {
+        text-shadow: none
+      }
+    }
+
+    .price-up {
+      color: var(--green) !important;
+      animation: pulseGreen .5s ease-out
+    }
+
+    .price-down {
+      color: var(--red) !important;
+      animation: pulseRed .5s ease-out
+    }
+
+    /* ── Empty State ────────────────────────────────── */
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 30px 10px;
+      font-size: 13px
+    }
+
+    /* ── History rows coloring ──────────────────────── */
+    .row-buy td:nth-child(3) {
+      color: var(--green);
+      font-weight: 600
+    }
+
+    .row-sell td:nth-child(3) {
+      color: var(--red);
+      font-weight: 600
+    }
+
+    /* ── Price Chart ─────────────────────────────── */
+    .price-chart-wrap {
+      margin-top: 12px;
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+
+    .price-chart-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+
+    .price-chart-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      color: var(--muted);
+    }
+
+    .chart-toolbar-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .chart-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      border-radius: var(--radius-sm);
+      padding: 3px 6px;
+      cursor: pointer;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      transition: color .15s, border-color .15s;
+    }
+
+    .chart-btn:hover {
+      color: var(--text);
+      border-color: var(--accent);
+    }
+
+    #priceChartContainer {
+      width: 100%;
+      height: 240px;
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    /* Fullscreen wrapper */
+    #chartFullscreenWrap.chart-fullscreen {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: #0f1117;
+      display: flex;
+      flex-direction: column;
+      padding: 12px;
+    }
+
+    #chartFullscreenWrap.chart-fullscreen #priceChartContainer {
+      flex: 1;
+      height: 0;
+      /* flex child – height driven by flex */
+    }
+  </style>
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+
+<body>
+
+  <!-- ── Top Bar ──────────────────────────────────── -->
+  <div class="topbar">
+    <h1>ETHUSD Analyzer</h1>
+    <div class="price-block">
+      <span id="priceDisplay">--</span>
+      <span id="priceSpread"></span>
+    </div>
+    <div class="controls">
+      <select id="tf">
+        <option value="1m">1 min</option>
+        <option value="5m">5 min</option>
+        <option value="15m" selected>15 min</option>
+        <option value="30m">30 min</option>
+      </select>
+      <span class="pill" id="statusPill"><span class="spinner"></span> loading</span>
+      <button class="btn" id="refreshBtn">Refresh</button>
+    </div>
+  </div>
+
+  <!-- ── Main Content ────────────────────────────── -->
+  <div class="container">
+
+    <!-- Row 1: Signal + Calibration -->
+    <div class="grid-2" style="margin-bottom:14px">
+
+      <!-- Signal Recommendation -->
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Signal Recommendation</h3>
+          <span class="pill" id="signalExpiry">--</span>
+        </div>
+        <div class="card-body" id="signalCard">
+          <div class="no-signal-msg" id="noSignalMsg">No signal data yet</div>
+          <div id="signalContent" style="display:none">
+            <div class="signal-hero">
+              <span class="pill" id="regimePill">--</span>
+              <span class="pill" id="signalPill">--</span>
+              <span class="pill" id="confPill">--</span>
+            </div>
+            <div class="signal-grid">
+              <div class="signal-metric">
+                <div class="label">Entry</div>
+                <div class="value" id="sigEntry">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Take Profit</div>
+                <div class="value" id="sigTP" style="color:var(--green)">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Stop Loss</div>
+                <div class="value" id="sigSL" style="color:var(--red)">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Hold Bars</div>
+                <div class="value" id="sigHold">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Volatility</div>
+                <div class="value" id="sigVol">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Computed At</div>
+                <div class="value" id="sigTime" style="font-size:11px">--</div>
+              </div>
+            </div>
+            <div class="signal-grid" style="margin-top:8px">
+              <div class="signal-metric">
+                <div class="label">Conf Regime</div>
+                <div class="value" id="sigCR">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Conf Tail</div>
+                <div class="value" id="sigCT">--</div>
+              </div>
+              <div class="signal-metric">
+                <div class="label">Conf Backtest</div>
+                <div class="value" id="sigCB">--</div>
+              </div>
+            </div>
+            <div class="signal-reason" id="sigReason"></div>
+          </div>
+          <!-- ── Price Chart ── -->
+          <div class="price-chart-wrap" id="chartFullscreenWrap">
+            <div class="price-chart-toolbar">
+              <span class="price-chart-label">Price Chart</span>
+              <div class="chart-toolbar-right">
+                <span id="chartTfBadge" class="pill" style="font-size:10px;padding:1px 6px"></span>
+                <button class="chart-btn" id="chartFsBtn" title="Fullscreen"><svg width="13" height="13"
+                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path
+                      d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                  </svg></button>
+              </div>
+            </div>
+            <div id="priceChartContainer"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Calibration -->
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Calibration</h3>
+          <span class="pill" id="calStatusPill">--</span>
+        </div>
+        <div class="card-body" id="calCard">
+          <div class="empty" id="noCalMsg">No calibration data yet</div>
+          <div id="calContent" style="display:none">
+            <table class="kv-table" id="calTable">
+              <tbody></tbody>
+            </table>
+            <div id="calParamsWrap" style="margin-top:8px">
+              <div
+                style="font-size:11px;color:var(--muted);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.3px">
+                Best Params</div>
+              <table class="kv-table" id="calParamsTable">
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="cal-warn" id="calWarn" style="display:none"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 2: Snapshot + Sanity -->
+    <div class="grid-2" style="margin-bottom:14px">
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Latest Snapshot</h3>
+        </div>
+        <div class="card-body">
+          <table class="kv-table" id="snapshotTable">
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Sanity Checks</h3>
+        </div>
+        <div class="card-body">
+          <table class="kv-table" id="sanityTable">
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 3: Signal History (full width) -->
+    <div style="margin-bottom:14px">
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Signal History</h3><span class="muted" style="font-size:11px">Last 50 recommendations</span>
+        </div>
+        <div class="card-body no-pad">
+          <div class="scroll-box" style="max-height:340px">
+            <table class="data-table" id="historyTable">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Regime</th>
+                  <th>Signal</th>
+                  <th>Conf</th>
+                  <th>Entry</th>
+                  <th>TP</th>
+                  <th>SL</th>
+                  <th>Hold</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 4: Correlation tables -->
+    <div class="grid-2" style="margin-bottom:14px">
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Correlations vs Forward Returns</h3>
+        </div>
+        <div class="card-body no-pad">
+          <div class="scroll-box">
+            <table class="data-table" id="corrTable">
+              <thead>
+                <tr>
+                  <th>H</th>
+                  <th>Feature</th>
+                  <th>N</th>
+                  <th>Pearson r</th>
+                  <th>Pearson p</th>
+                  <th>Spearman r</th>
+                  <th>Spearman p</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Lag Correlation</h3><span style="font-size:10px;color:var(--muted)">score vs fwd_ret_1</span>
+        </div>
+        <div class="card-body no-pad">
+          <div class="scroll-box">
+            <table class="data-table" id="lagTable">
+              <thead>
+                <tr>
+                  <th>Lag</th>
+                  <th>N</th>
+                  <th>Pearson r</th>
+                  <th>Pearson p</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 5: Rolling + Notes -->
+    <div class="grid-2" style="margin-bottom:14px">
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Rolling Correlations</h3><span style="font-size:10px;color:var(--muted)">w=20 / w=50</span>
+        </div>
+        <div class="card-body no-pad">
+          <div class="scroll-box">
+            <table class="data-table" id="rollTable">
+              <thead>
+                <tr>
+                  <th>Market Time</th>
+                  <th>W20</th>
+                  <th>W50</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card fade-in">
+        <div class="card-header">
+          <h3>Notes</h3>
+        </div>
+        <div class="card-body">
+          <ul class="notes-list">
+            <li>If buyers+sellers deviation is large, your % columns are inconsistent.</li>
+            <li>Lag peaks at negative lags are more useful than positive lags.</li>
+            <li>Correlations are often small; stability matters (rolling table).</li>
+            <li>Signals are generated when regime is active (MR or MOM).</li>
+            <li>Calibration uses walk-forward IS/OOS split with min_trades filter.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /container -->
+
+  <script>
+    /* ── DOM refs ───────────────────────────────────── */
+    const $ = id => document.getElementById(id);
+    const tfEl = $("tf"), statusPill = $("statusPill"), refreshBtn = $("refreshBtn");
+    const priceDisplay = $("priceDisplay"), priceSpread = $("priceSpread");
+    const signalExpiry = $("signalExpiry");
+    const noSignalMsg = $("noSignalMsg"), signalContent = $("signalContent");
+    const regimePill = $("regimePill"), signalPill = $("signalPill"), confPill = $("confPill");
+    const sigEntry = $("sigEntry"), sigTP = $("sigTP"), sigSL = $("sigSL");
+    const sigHold = $("sigHold"), sigVol = $("sigVol"), sigTime = $("sigTime");
+    const sigCR = $("sigCR"), sigCT = $("sigCT"), sigCB = $("sigCB"), sigReason = $("sigReason");
+    const noCalMsg = $("noCalMsg"), calContent = $("calContent");
+    const calStatusPill = $("calStatusPill");
+    const calWarn = $("calWarn");
+    const corrBody = document.querySelector("#corrTable tbody");
+    const lagBody = document.querySelector("#lagTable tbody");
+    const rollBody = document.querySelector("#rollTable tbody");
+    const histBody = document.querySelector("#historyTable tbody");
+
+    /* ── Formatters ───────────────────────────────── */
+    function fmt(x) {
+      if (x === null || x === undefined) return "—";
+      if (typeof x === "number") return (Math.abs(x) < 1e-6 ? x.toExponential(2) : x.toFixed(6));
+      return String(x);
+    }
+    function fmtShort(x, d) {
+      if (x === null || x === undefined) return "—";
+      return Number(x).toFixed(d != null ? d : 2);
+    }
+    function fmtPrice(x) {
+      if (x === null || x === undefined) return "—";
+      return "$" + Number(x).toFixed(2);
+    }
+
+    /* Date formatter: dd-mm-yyyy hh:mm:ss (12h) */
+    function fmtDate(raw) {
+      if (!raw) return "—";
+      const d = new Date(raw);
+      if (isNaN(d.getTime())) return String(raw);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const yy = d.getFullYear();
+      let hh = d.getHours();
+      const ampm = hh >= 12 ? "PM" : "AM";
+      hh = hh % 12 || 12;
+      const mi = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}-${mm}-${yy} ${hh}:${mi}:${ss} ${ampm}`;
+    }
+
+    /* Timeframe duration in ms for expiry calc */
+    const TF_MS = { "1m": 60000, "5m": 300000, "15m": 900000, "30m": 1800000 };
+
+    function computeExpiry(computedAt, holdBars, tf) {
+      if (!computedAt || !holdBars) return { expired: true, label: "Unknown" };
+      const start = new Date(computedAt).getTime();
+      const dur = (TF_MS[tf] || 60000) * holdBars;
+      const expMs = start + dur;
+      const now = Date.now();
+      if (now >= expMs) return { expired: true, label: "Expired" };
+      const rem = expMs - now;
+      const mins = Math.floor(rem / 60000);
+      const secs = Math.floor((rem % 60000) / 1000);
+      return { expired: false, label: `${mins}m ${secs}s left` };
+    }
+
+    async function fetchJson(url, timeoutMs = 5000) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      let r;
+      try {
+        r = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!r.ok) throw new Error(await r.text());
+      return await r.json();
+    }
+
+    function settledValue(res, fallback) {
+      return res && res.status === "fulfilled" ? res.value : fallback;
+    }
+
+    /* ── Build KV table rows ──────────────────────── */
+    function fillKV(tableId, pairs) {
+      const tb = document.querySelector("#" + tableId + " tbody");
+      tb.innerHTML = "";
+      pairs.forEach(([k, v]) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${k}</td><td>${v}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+
+    /* ── Main Refresh ─────────────────────────────── */
+    async function refresh() {
+      const tf = tfEl.value;
+      statusPill.innerHTML = '<span class="spinner"></span> updating';
+      statusPill.className = "pill";
+      try {
+        const results = await Promise.allSettled([
+          fetchJson(`/api/snapshot?tf=${encodeURIComponent(tf)}`),
+          fetchJson(`/api/corr?tf=${encodeURIComponent(tf)}`),
+          fetchJson(`/api/lagcorr?tf=${encodeURIComponent(tf)}`),
+          fetchJson(`/api/rolling?tf=${encodeURIComponent(tf)}`),
+          fetchJson(`/api/signals?tf=${encodeURIComponent(tf)}`),
+          fetchJson(`/api/calibration?tf=${encodeURIComponent(tf)}`),
+          fetchJson(`/api/signals/history?tf=${encodeURIComponent(tf)}&limit=50`),
+        ]);
+        const snap = settledValue(results[0], { timeframe: tf, error: "snapshot unavailable" });
+        const corr = settledValue(results[1], { timeframe: tf, items: [] });
+        const lag = settledValue(results[2], { timeframe: tf, items: [] });
+        const roll = settledValue(results[3], { timeframe: tf, items: [] });
+        const sig = settledValue(results[4], { timeframe: tf, signal: "NONE", reason: "signal unavailable" });
+        const cal = settledValue(results[5], { timeframe: tf, error: "calibration unavailable" });
+        const hist = settledValue(results[6], { timeframe: tf, items: [] });
+
+        const failedCount = results.filter(r => r.status === "rejected").length;
+
+        /* ── Snapshot (KV table) ── */
+        if (!snap.error) {
+          fillKV("snapshotTable", [
+            ["Timeframe", snap.timeframe || tf],
+            ["Rows", snap.rows ?? "—"],
+            ["Start Time", fmtDate(snap.start_time)],
+            ["End Time", fmtDate(snap.end_time)],
+            ["Latest Close", fmtPrice(snap.latest_close)],
+            ["Latest Score", fmtShort(snap.latest_score, 6)],
+            ["Computed At", fmtDate(snap.computed_at)],
+          ]);
+        } else {
+          fillKV("snapshotTable", [["Status", snap.error]]);
+        }
+
+        /* ── Sanity (KV table) ── */
+        const diff = (snap.buyers_plus_sellers_mean_abs_diff ?? 0);
+        const bad = diff > 0.5;
+        const diffColor = bad ? "var(--red)" : "var(--green)";
+        fillKV("sanityTable", [
+          ["Rows", snap.rows ?? "—"],
+          ["Time Range", fmtDate(snap.start_time) + " → " + fmtDate(snap.end_time)],
+          ["Buyers+Sellers Diff", "<span style='color:" + diffColor + "'>" + fmtShort(diff, 6) + "</span>"],
+          ["Latest Score", fmtShort(snap.latest_score, 6)],
+        ]);
+        /* render the span html in the diff cell */
+        const sanityRows = document.querySelectorAll("#sanityTable tbody tr");
+        if (sanityRows[2]) { sanityRows[2].querySelector("td:last-child").innerHTML = "<span style='color:" + diffColor + "'>" + fmtShort(diff, 6) + "</span>"; }
+
+        if (failedCount > 0) {
+          statusPill.innerHTML = "partial (" + failedCount + ")";
+          statusPill.className = "pill warn";
+        } else {
+          statusPill.innerHTML = bad ? "sanity warning" : "ok";
+          statusPill.className = "pill " + (bad ? "bad" : "ok");
+        }
+
+        /* ── Signal Card ── */
+        if (sig.signal && sig.signal !== "NONE" && sig.signal !== "NO_SIGNAL") {
+          noSignalMsg.style.display = "none";
+          signalContent.style.display = "block";
+          regimePill.textContent = sig.regime || "--";
+          regimePill.className = "pill " + (sig.regime === "MR" ? "mr" : sig.regime === "MOM" ? "mom" : "");
+          signalPill.textContent = sig.signal;
+          signalPill.className = "pill " + (sig.signal === "BUY" ? "buy" : "sell");
+          confPill.textContent = sig.confidence != null ? "Conf " + fmtShort(sig.confidence, 2) : "--";
+          confPill.className = "pill" + (sig.confidence >= 0.7 ? " ok" : "");
+          sigEntry.textContent = fmtPrice(sig.entry_price);
+          sigTP.textContent = fmtPrice(sig.take_profit);
+          sigSL.textContent = fmtPrice(sig.stop_loss);
+          sigHold.textContent = sig.hold_bars != null ? sig.hold_bars + " bars" : "—";
+          sigVol.textContent = sig.volatility != null ? fmtShort(sig.volatility, 8) : "—";
+          sigTime.textContent = fmtDate(sig.computed_at);
+          sigCR.textContent = fmtShort(sig.conf_regime, 4);
+          sigCT.textContent = fmtShort(sig.conf_tail, 4);
+          sigCB.textContent = fmtShort(sig.conf_backtest, 4);
+          sigReason.textContent = sig.reason || "";
+
+          /* Expiry */
+          const exp = computeExpiry(sig.computed_at, sig.hold_bars, tf);
+          signalExpiry.textContent = exp.label;
+          signalExpiry.className = "pill " + (exp.expired ? "expired" : "active");
+        } else {
+          noSignalMsg.style.display = "block";
+          noSignalMsg.textContent = sig.reason || "No active signal for this timeframe.";
+          signalContent.style.display = "none";
+          signalExpiry.textContent = "--";
+          signalExpiry.className = "pill";
+        }
+
+        /* ── Calibration (KV table) ── */
+        if (cal && !cal.error) {
+          noCalMsg.style.display = "none";
+          calContent.style.display = "block";
+          const st = cal.status || "OK";
+          calStatusPill.textContent = st;
+          calStatusPill.className = "pill " + (st === "OK" ? "ok" : st === "NO_VALID_PARAMS" ? "warn" : "bad");
+          fillKV("calTable", [
+            ["Status", st],
+            ["Net Sharpe", fmtShort(cal.net_sharpe, 4)],
+            ["Net Return", fmtShort(cal.net_return, 6)],
+            ["Max Drawdown", fmtShort(cal.max_drawdown, 4)],
+            ["Trades", cal.n_trades ?? "—"],
+            ["Win Rate", cal.win_rate != null ? (Number(cal.win_rate) * 100).toFixed(1) + "%" : "—"],
+            ["Eligible / Total", (cal.eligible_candidates != null ? cal.eligible_candidates : "?") + " / " + (cal.total_candidates != null ? cal.total_candidates : cal.param_grid_size)],
+            ["Min Trades", cal.min_trades != null ? cal.min_trades : "—"],
+            ["Lookback", cal.lookback_days + "d"],
+            ["Computed At", fmtDate(cal.computed_at)],
+          ]);
+          // Best params as KV
+          const bp = cal.best_params || {};
+          const ppairs = Object.entries(bp).map(([k, v]) => [k, typeof v === "number" ? fmtShort(v, 6) : String(v)]);
+          fillKV("calParamsTable", ppairs);
+          if (cal.rejection_reason) {
+            calWarn.style.display = "block";
+            calWarn.textContent = cal.rejection_reason;
+          } else {
+            calWarn.style.display = "none";
+          }
+        } else {
+          noCalMsg.style.display = "block";
+          noCalMsg.textContent = cal.error || "No calibration data yet.";
+          calContent.style.display = "none";
+          calStatusPill.textContent = "--";
+          calStatusPill.className = "pill";
+        }
+
+        /* ── Price Chart ── update signal overlays only; bars reload on their own schedule */
+        scheduleChartRefresh(tf);
+        _applySignalLines(sig);
+
+        /* ── Signal History ── */
+        histBody.innerHTML = "";
+        const histItems = hist.items || [];
+        if (histItems.length === 0) {
+          histBody.innerHTML = '<tr><td colspan="9" class="empty">No signal history yet</td></tr>';
+        } else {
+          histItems.forEach(row => {
+            const exp = computeExpiry(row.computed_at, row.hold_bars, tf);
+            const tr = document.createElement("tr");
+            tr.className = row.signal === "BUY" ? "row-buy" : row.signal === "SELL" ? "row-sell" : "";
+            tr.innerHTML =
+              `<td style="font-size:11px">${fmtDate(row.computed_at)}</td>` +
+              `<td><span class="pill ${row.regime === 'MR' ? 'mr' : row.regime === 'MOM' ? 'mom' : ''}">${row.regime}</span></td>` +
+              `<td>${row.signal}</td>` +
+              `<td>${fmtShort(row.confidence, 2)}</td>` +
+              `<td>${fmtPrice(row.entry_price)}</td>` +
+              `<td style="color:var(--green)">${fmtPrice(row.take_profit)}</td>` +
+              `<td style="color:var(--red)">${fmtPrice(row.stop_loss)}</td>` +
+              `<td>${row.hold_bars != null ? row.hold_bars : "—"}</td>` +
+              `<td><span class="pill ${exp.expired ? 'expired' : 'active'}">${exp.label}</span></td>`;
+            histBody.appendChild(tr);
+          });
+        }
+
+        /* ── Correlations ── */
+        corrBody.innerHTML = "";
+        (corr.items || []).forEach(row => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${row.horizon}</td><td style="font-family:var(--mono)">${row.feature}</td><td>${row.n}</td>` +
+            `<td>${fmt(row.pearson_r)}</td><td>${fmt(row.pearson_p)}</td>` +
+            `<td>${fmt(row.spearman_r)}</td><td>${fmt(row.spearman_p)}</td>`;
+          corrBody.appendChild(tr);
+        });
+
+        /* ── Lag Correlation ── */
+        lagBody.innerHTML = "";
+        (lag.items || []).forEach(row => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${row.lag}</td><td>${row.n}</td><td>${fmt(row.pearson_r)}</td><td>${fmt(row.pearson_p)}</td>`;
+          lagBody.appendChild(tr);
+        });
+
+        /* ── Rolling ── */
+        rollBody.innerHTML = "";
+        (roll.items || []).forEach(row => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td style="font-size:11px">${fmtDate(row.market_time)}</td><td>${fmt(row.w20)}</td><td>${fmt(row.w50)}</td>`;
+          rollBody.appendChild(tr);
+        });
+
+      } catch (e) {
+        statusPill.textContent = "error";
+        statusPill.className = "pill bad";
+        console.error("Refresh failed:", e);
+      }
+    }
+
+    /* ── Price Chart (Lightweight Charts) ─────────────────────────────────────
+       Chart is initialised ONCE and lives independently of the page auto-refresh.
+       • loadChartBars()    – called on TF change + every 30 s (not on every page refresh)
+       • pushLiveTick()     – called every 1 s from the price poll; updates last candle
+       • _applySignalLines()– called from refresh() to draw Entry/TP/SL overlays
+    ──────────────────────────────────────────────────────────────────────────── */
+    let _lwChart = null;
+    let _candleSeries = null;
+    let _volSeries = null;
+    let _entryLine = null;
+    let _tpLine = null;
+    let _slLine = null;
+    let _chartBars = [];          // mutable copy of last loaded bars
+    let _chartTf = null;          // TF currently displayed
+    let _chartLastBarTime = null; // epoch-seconds of the rightmost bar
+    let _chartLoadPending = false;
+    let _chartIntervalId = null;
+    let _lastChartTf = null;      // to detect TF change
+    const TF_SECS = { "1m": 60, "5m": 300, "15m": 900, "30m": 1800 };
+
+    function _initChart() {
+      if (_lwChart) return;
+      const el = document.getElementById("priceChartContainer");
+      _lwChart = LightweightCharts.createChart(el, {
+        autoSize: true,
+        layout: { background: { color: "#0f1117" }, textColor: "#7b8194", fontSize: 11 },
+        grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        rightPriceScale: { borderColor: "#2a2e3a" },
+        timeScale: { borderColor: "#2a2e3a", timeVisible: true, secondsVisible: false },
+      });
+      _candleSeries = _lwChart.addCandlestickSeries({
+        upColor: "#22c55e", downColor: "#ef4444",
+        borderUpColor: "#22c55e", borderDownColor: "#ef4444",
+        wickUpColor: "#22c55e", wickDownColor: "#ef4444",
+      });
+      _volSeries = _lwChart.addHistogramSeries({
+        color: "rgba(59,130,246,0.25)",
+        priceFormat: { type: "volume" },
+        priceScaleId: "vol",
+      });
+      _lwChart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    }
+
+    function _removePriceLines() {
+      if (!_candleSeries) return;
+      if (_entryLine) { _candleSeries.removePriceLine(_entryLine); _entryLine = null; }
+      if (_tpLine) { _candleSeries.removePriceLine(_tpLine); _tpLine = null; }
+      if (_slLine) { _candleSeries.removePriceLine(_slLine); _slLine = null; }
+    }
+
+    function _applySignalLines(sig) {
+      _removePriceLines();
+      if (!_candleSeries) return;
+      if (sig && sig.signal && sig.signal !== "NONE" && sig.signal !== "NO_SIGNAL" && sig.entry_price != null) {
+        _entryLine = _candleSeries.createPriceLine({ price: sig.entry_price, color: "#60a5fa", lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "Entry" });
+        if (sig.take_profit != null) _tpLine = _candleSeries.createPriceLine({ price: sig.take_profit, color: "#22c55e", lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "TP" });
+        if (sig.stop_loss != null) _slLine = _candleSeries.createPriceLine({ price: sig.stop_loss, color: "#ef4444", lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: "SL" });
+      }
+    }
+
+    // Full bar reload – only runs on TF change or every 30 s
+    async function loadChartBars(tf) {
+      if (_chartLoadPending) return;
+      _chartLoadPending = true;
+      try {
+        _initChart();
+        const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(tf)}&limit=300`);
+        const bars = (data.items || []).filter(b => b.open != null && b.time != null);
+        if (bars.length) {
+          _chartBars = bars.map(b => ({ ...b }));
+          _chartTf = tf;
+          _chartLastBarTime = bars[bars.length - 1].time;
+          _candleSeries.setData(bars);
+          _volSeries.setData(bars.map(b => ({
+            time: b.time, value: b.vol,
+            color: b.close >= b.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
+          })));
+          _lwChart.timeScale().fitContent();
+          document.getElementById("chartTfBadge").textContent = tf;
+        }
+      } catch (e) { console.warn("[chart] loadChartBars:", e); }
+      finally { _chartLoadPending = false; }
+    }
+
+    // Called every 1 s – updates the last/current bar close in-place (no flickering)
+    function pushLiveTick(price, tf) {
+      if (!_candleSeries || !_chartLastBarTime || _chartTf !== tf) return;
+      const tfSecs = TF_SECS[tf] || 60;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const curBarTime = Math.floor(nowSec / tfSecs) * tfSecs;
+      const prev = _chartBars.length ? _chartBars[_chartBars.length - 1] : null;
+      if (!prev) return;
+      if (curBarTime > _chartLastBarTime) {
+        // New bar opened – add placeholder; full reload picks it up within 30 s
+        const nb = { time: curBarTime, open: price, high: price, low: price, close: price, vol: 0 };
+        _chartBars.push(nb);
+        _chartLastBarTime = curBarTime;
+        _candleSeries.update(nb);
+        _volSeries.update({ time: curBarTime, value: 0, color: "rgba(59,130,246,0.25)" });
+      } else {
+        prev.high = Math.max(prev.high, price);
+        prev.low = Math.min(prev.low, price);
+        prev.close = price;
+        _candleSeries.update({ time: _chartLastBarTime, open: prev.open, high: prev.high, low: prev.low, close: price });
+        _volSeries.update({
+          time: _chartLastBarTime, value: prev.vol,
+          color: price >= prev.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
+        });
+      }
+    }
+
+    // Manages the 30-s reload interval; switches immediately on TF change
+    function scheduleChartRefresh(tf) {
+      if (tf !== _lastChartTf) {
+        _lastChartTf = tf;
+        loadChartBars(tf);
+        if (_chartIntervalId) clearInterval(_chartIntervalId);
+        _chartIntervalId = setInterval(() => loadChartBars(tf), 30000);
+      }
+    }
+
+    // Fullscreen
+    const _chartWrap = document.getElementById("chartFullscreenWrap");
+    const _chartFsBtn = document.getElementById("chartFsBtn");
+    const _FS_ICON_OPEN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>`;
+    const _FS_ICON_CLOSE = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>`;
+    _chartFsBtn.addEventListener("click", () => {
+      if (!document.fullscreenElement) _chartWrap.requestFullscreen().catch(() => { });
+      else document.exitFullscreen();
+    });
+    document.addEventListener("fullscreenchange", () => {
+      const isFs = !!document.fullscreenElement;
+      _chartWrap.classList.toggle("chart-fullscreen", isFs);
+      _chartFsBtn.innerHTML = isFs ? _FS_ICON_CLOSE : _FS_ICON_OPEN;
+      _chartFsBtn.title = isFs ? "Exit fullscreen" : "Fullscreen";
+    });
+
+    /* ── Live Price (1s poll) ─────────────────────── */
+    let lastPrice = null;
+    let priceAnimTimer = null;
+    async function refreshPrice() {
+      try {
+        const p = await fetchJson("/api/price");
+        if (p.price != null) {
+          const cur = Number(p.price);
+          priceDisplay.textContent = "$" + cur.toFixed(2);
+          /* Update browser tab title */
+          document.title = `$${cur.toFixed(2)} | ETHUSD Dashboard`;
+
+          if (lastPrice !== null && cur !== lastPrice) {
+            priceDisplay.className = cur > lastPrice ? "price-up" : "price-down";
+            clearTimeout(priceAnimTimer);
+            priceAnimTimer = setTimeout(() => { priceDisplay.className = "" }, 600);
+          }
+          lastPrice = cur;
+          pushLiveTick(cur, tfEl.value);
+          const bid = p.bid != null ? Number(p.bid).toFixed(2) : "--";
+          const ask = p.ask != null ? Number(p.ask).toFixed(2) : "--";
+          const spread = p.bid != null && p.ask != null ? (Number(p.ask) - Number(p.bid)).toFixed(2) : "--";
+          priceSpread.textContent = `Bid ${bid} / Ask ${ask} · Spread ${spread}`;
+        }
+      } catch (e) { }
+    }
+    setInterval(refreshPrice, 1000);
+    refreshPrice();
+
+    /* ── Auto-update signal expiry every second ───── */
+    let cachedSig = null;
+    const origRefresh = refresh;
+    async function wrappedRefresh() {
+      await origRefresh();
+    }
+
+    /* ── Event Bindings ───────────────────────────── */
+    tfEl.addEventListener("change", refresh);
+    refreshBtn.addEventListener("click", refresh);
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,6 @@
+# Inline JS in this file uses template literals with double quotes inside ${} expressions.
+# Prettier corrupts those expressions — keep this file unformatted.
+ethusd_analyzer/static/index.html
+
+# Notifier sidecar — managed separately, keep untouched by project formatter
+notifier/

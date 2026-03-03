@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Environment / secrets — real credentials live here, never commit
+config.yaml
+.env
+*.env
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+*.DS_Store
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Node / WhatsApp notifier
+notifier/node_modules/
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+notifier/.wwebjs_auth/
+notifier/.wwebjs_cache/
+notifier/session*
+session*/
+
+# Output files (large CSVs, generated reports)
+outputs/*.csv
+
+# Logs
+*.log
+logs/
+
+# Compiled / binary
+*.so
+*.dylib

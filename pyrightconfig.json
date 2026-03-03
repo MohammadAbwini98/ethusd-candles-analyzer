@@ -1,0 +1,7 @@
+{
+  "venvPath": "ethusd_analyzer",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "include": ["ethusd_analyzer"],
+  "exclude": ["ethusd_analyzer/.venv"]
+}
