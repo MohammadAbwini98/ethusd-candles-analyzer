@@ -102,23 +102,32 @@ class CandleBuilder:
 
 
 def insert_candles(engine: Engine, schema: str, candles: List[Dict]) -> int:
-    """Upsert candle rows into {schema}.candles. Returns count inserted."""
+    """Upsert candle rows into {schema}.candles. Returns count inserted.
+
+    Rows may optionally include a ``sentiment_ts`` key; it defaults to NULL
+    so that legacy callers (e.g. backfill) continue to work unchanged.
+    """
     if not candles:
         return 0
+    # Normalise: ensure sentiment_ts key is always present
+    for row in candles:
+        row.setdefault("sentiment_ts", None)
     sql = text(f"""
         INSERT INTO {schema}.candles
-            (ts, epic, timeframe, open, high, low, close, vol, buyers_pct, sellers_pct)
+            (ts, epic, timeframe, open, high, low, close, vol,
+             buyers_pct, sellers_pct, sentiment_ts)
         VALUES
-            (:ts, :epic, :timeframe, :open, :high, :low, :close, :vol, :buyers_pct, :sellers_pct)
-        ON CONFLICT (ts, epic, timeframe)
-        DO UPDATE SET
-            open = EXCLUDED.open,
-            high = EXCLUDED.high,
-            low  = EXCLUDED.low,
-            close = EXCLUDED.close,
-            vol   = EXCLUDED.vol,
-            buyers_pct = EXCLUDED.buyers_pct,
-            sellers_pct = EXCLUDED.sellers_pct
+            (:ts, :epic, :timeframe, :open, :high, :low, :close, :vol,
+             :buyers_pct, :sellers_pct, :sentiment_ts)
+        ON CONFLICT (ts, epic, timeframe) DO UPDATE SET
+            open         = EXCLUDED.open,
+            high         = EXCLUDED.high,
+            low          = EXCLUDED.low,
+            close        = EXCLUDED.close,
+            vol          = EXCLUDED.vol,
+            buyers_pct   = EXCLUDED.buyers_pct,
+            sellers_pct  = EXCLUDED.sellers_pct,
+            sentiment_ts = EXCLUDED.sentiment_ts
     """)
     with engine.begin() as conn:
         conn.execute(sql, candles)

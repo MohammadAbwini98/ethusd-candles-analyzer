@@ -102,6 +102,15 @@ def init_schema_and_tables(engine: Engine, schema: str) -> None:
             )""",
         f"CREATE INDEX IF NOT EXISTS candles_tf_ts_idx ON {schema}.candles(timeframe, ts DESC)",
         f"CREATE INDEX IF NOT EXISTS candles_epic_tf_idx ON {schema}.candles(epic, timeframe, ts DESC)",
+        # Sentiment tick log — used for as-of sentiment attachment to candles
+        f"""CREATE TABLE IF NOT EXISTS {schema}.sentiment_ticks (
+              ts          TIMESTAMPTZ        NOT NULL,
+              epic        TEXT               NOT NULL,
+              buyers_pct  DOUBLE PRECISION   NOT NULL,
+              sellers_pct DOUBLE PRECISION   NOT NULL,
+              PRIMARY KEY (ts, epic)
+            )""",
+        f"CREATE INDEX IF NOT EXISTS sentiment_ticks_epic_ts_idx ON {schema}.sentiment_ticks(epic, ts DESC)",
         f"""CREATE TABLE IF NOT EXISTS {schema}.signal_recommendations (
               id BIGSERIAL PRIMARY KEY,
               timeframe TEXT NOT NULL,
@@ -212,6 +221,10 @@ def init_schema_and_tables(engine: Engine, schema: str) -> None:
         EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
         f"""DO $$ BEGIN
             ALTER TABLE {schema}.calibration_runs ADD COLUMN best_dd_seen DOUBLE PRECISION;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        # Ingestion: timestamp of sentiment record attached to each candle
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.candles ADD COLUMN sentiment_ts TIMESTAMPTZ;
         EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
     ]
 

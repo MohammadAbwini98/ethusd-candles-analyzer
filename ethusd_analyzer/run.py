@@ -127,7 +127,9 @@ def sanity_checks(df: pd.DataFrame) -> dict:
         "buyers_sellers_max_abs_diff": float(bps.max()),
     }
 
-def write_files(tf: str, df_feat: pd.DataFrame, out_dir: Path, horizons, lag_range: int, roll_windows):
+def write_files(tf: str, df_feat: pd.DataFrame, out_dir: Path, horizons, lag_range: int, roll_windows,
+                df_eval: Optional[pd.DataFrame] = None):
+    # Summary always from the FULL frame so the latest bar is reflected.
     summary = {
         "timeframe": tf,
         "rows": int(len(df_feat)),
@@ -139,26 +141,37 @@ def write_files(tf: str, df_feat: pd.DataFrame, out_dir: Path, horizons, lag_ran
     }
     save_json(out_dir / f"summary_{tf}.json", summary)
 
-    corr = correlation_table(df_feat, horizons=horizons)
+    # Offline correlation tables require non-null fwd_ret_* labels.
+    # Use df_eval when provided; otherwise trim on the fly.
+    _df_corr = df_eval if df_eval is not None else df_feat.dropna(subset=["fwd_ret_1"])
+
+    corr = correlation_table(_df_corr, horizons=horizons)
     corr.to_csv(out_dir / f"corr_{tf}.csv", index=False)
 
-    lag = lag_correlation(df_feat, horizon=1, feature="score", lag_range=lag_range)
+    lag = lag_correlation(_df_corr, horizon=1, feature="score", lag_range=lag_range)
     lag.to_csv(out_dir / f"lagcorr_{tf}.csv", index=False)
 
-    roll = rolling_correlations(df_feat, horizon=1, feature="score", windows=roll_windows)
+    roll = rolling_correlations(_df_corr, horizon=1, feature="score", windows=roll_windows)
     roll.to_csv(out_dir / f"rollingcorr_{tf}.csv", index=False)
 
     return summary, corr, lag, roll
 
 def build_timeframes(df_1m: pd.DataFrame, z_window: int, resamples):
+    """Return FULL feature frames (latest bar included) for every timeframe.
+
+    fwd_ret_1/fwd_ret_2 are kept as NaN on the last row so that offline
+    correlation tables can operate on a trimmed copy while live strategy
+    evaluation always sees the newest candle.
+    """
     results = {}
     df1 = pd.DataFrame(df_1m[["market_time","close","vol","buyers_pct","sellers_pct"]])
-    df1_feat = add_features(df1, z_window=z_window).dropna(subset=["fwd_ret_1"])
+    # No dropna — latest bar must be present for real-time signal generation.
+    df1_feat = add_features(df1, z_window=z_window)
     results["1m"] = df1_feat
 
     for rule in resamples:
         dfr = resample_timeframe(df1, rule)
-        dfr_feat = add_features(pd.DataFrame(dfr), z_window=z_window).dropna(subset=["fwd_ret_1"])
+        dfr_feat = add_features(pd.DataFrame(dfr), z_window=z_window)
         tf_label = rule.replace("min", "m")
         results[tf_label] = dfr_feat
     return results
@@ -194,7 +207,11 @@ def _run_analysis_cycle(engine, schema, table, cols, epic_value, start_ts,
     feats_by_tf = build_timeframes(df, z_window, resamples)
 
     for tf, df_feat in feats_by_tf.items():
-        summary, corr, lag, roll = write_files(tf, df_feat, out_dir, horizons, lag_range, roll_windows)
+        # Eval frame: trim the last row (fwd_ret NaN) for offline label-based stats.
+        df_eval = df_feat.dropna(subset=["fwd_ret_1"])
+        summary, corr, lag, roll = write_files(
+            tf, df_feat, out_dir, horizons, lag_range, roll_windows, df_eval=df_eval
+        )
         if out_cfg.enabled:
             save_snapshot(engine, out_cfg.schema, tf, summary, corr, lag, roll, out_cfg)
 
@@ -377,7 +394,12 @@ def _run_capital_mode(cfg, engine, out_cfg, dash, out_dir,
                       z_window, resamples, horizons, lag_range, roll_windows,
                       strategy_cfg=None, strategy_tfs=None, calibration_state=None):
     from .capital_api import CapitalSession
-    from .candle_builder import CandleBuilder, insert_candles
+    from .candle_builder import insert_candles   # still used for backfill
+    from .ingestion import (
+        fetch_and_upsert_1m,
+        resample_and_upsert,
+        insert_sentiment_tick,
+    )
 
     cap_raw = cfg.raw.get("capital", {})
     epic = cap_raw.get("epic", cfg.filters.get("epic", "ETHUSD"))
@@ -442,18 +464,21 @@ def _run_capital_mode(cfg, engine, out_cfg, dash, out_dir,
                     epic, "MINUTE", hours_back=history_hours, start_from=backfill_start,
                 )
                 if raw_candles:
-                    sentiment = session.get_sentiment(epic)
+                    # Historical candles get neutral sentiment (50/50) and
+                    # sentiment_ts=NULL — avoid smearing a single current
+                    # sentiment value across all history.
                     candle_rows = [{
-                        "ts": c["time"],
-                        "epic": epic,
-                        "timeframe": "1m",
-                        "open": c["open"],
-                        "high": c["high"],
-                        "low": c["low"],
-                        "close": c["close"],
-                        "vol": c["volume"],
-                        "buyers_pct": sentiment["buyers_pct"],
-                        "sellers_pct": sentiment["sellers_pct"],
+                        "ts":          c["time"],
+                        "epic":        epic,
+                        "timeframe":   "1m",
+                        "open":        c["open"],
+                        "high":        c["high"],
+                        "low":         c["low"],
+                        "close":       c["close"],
+                        "vol":         c["volume"],
+                        "buyers_pct":  50.0,
+                        "sellers_pct": 50.0,
+                        "sentiment_ts": None,
                     } for c in raw_candles]
                     n = insert_candles(engine, schema, candle_rows)
                     print(f"[backfill] Inserted {n} candles "
@@ -463,31 +488,57 @@ def _run_capital_mode(cfg, engine, out_cfg, dash, out_dir,
         except Exception as e:
             print(f"[backfill] Failed: {e} — continuing with live data")
 
-    # ── Phase 2: live loop ──
-    print(f"[live] Starting tick poll every {tick_poll}s | sentiment every {sentiment_poll}s | analysis every {save_every}s")
+    # ── Phase 2: live polling ──
+    candle_poll_seconds = float(cap_raw.get("candle_poll_seconds", 65))
 
-    builder = CandleBuilder(epic=epic)
-    sentiment_cache = {"buyers_pct": 50.0, "sellers_pct": 50.0}
-    last_sentiment = 0.0
-    last_analysis = 0.0
+    # Sentiment cache includes timestamp so as-of logic never smears
+    sentiment_cache: Dict[str, Any] = {
+        "ts": None,
+        "buyers_pct": 50.0,
+        "sellers_pct": 50.0,
+    }
+    zero_vol_state: Dict[str, int] = {"consecutive": 0}
+
+    last_sentiment   = 0.0
+    last_candle_poll = 0.0
+    last_analysis    = 0.0
+
+    print(
+        f"[live] Starting — tick_poll={tick_poll}s | sentiment_poll={sentiment_poll}s "
+        f"| candle_poll={candle_poll_seconds}s | analysis={save_every}s"
+    )
 
     try:
         while True:
             tnow = time.time()
 
-            # refresh sentiment
+            # ── Sentiment: persist to DB + refresh in-memory cache ──────────
             if (tnow - last_sentiment) >= sentiment_poll:
                 try:
-                    sentiment_cache = session.get_sentiment(epic)
+                    sdata = session.get_sentiment(epic)
+                    ts_now = datetime.now(timezone.utc)
+                    sentiment_cache = {
+                        "ts":          ts_now,
+                        "buyers_pct":  sdata["buyers_pct"],
+                        "sellers_pct": sdata["sellers_pct"],
+                    }
+                    insert_sentiment_tick(
+                        engine, schema, epic, ts_now,
+                        sdata["buyers_pct"], sdata["sellers_pct"],
+                    )
+                    logger.info(
+                        "[sentiment] ts=%s buyers=%.1f%% sellers=%.1f%%",
+                        ts_now.isoformat(),
+                        sdata["buyers_pct"], sdata["sellers_pct"],
+                    )
                     last_sentiment = tnow
                 except Exception as e:
-                    logger.warning(f"Sentiment fetch failed: {e}")
+                    logger.warning(f"[sentiment] Fetch failed: {e}")
 
-            # poll live price
+            # ── Live price: dashboard tick update ONLY (no candle building) ─
             try:
                 live = session.get_live_price(epic)
                 ts_now = datetime.now(timezone.utc)
-                # Push live tick to dashboard
                 if dash is not None:
                     dash.update_live_price(
                         price=live["mid"],
@@ -495,22 +546,34 @@ def _run_capital_mode(cfg, engine, out_cfg, dash, out_dir,
                         ask=live["ask"],
                         ts=ts_now.isoformat(),
                     )
-                completed = builder.on_tick(
-                    price=live["mid"],
-                    volume=0.0,
-                    ts=ts_now,
-                    buyers_pct=sentiment_cache["buyers_pct"],
-                    sellers_pct=sentiment_cache["sellers_pct"],
-                )
-                if completed:
-                    insert_candles(engine, schema, completed)
-                    for c in completed:
-                        if c["timeframe"] != "tick":
-                            print(f"  [{c['timeframe']}] candle closed: {c['ts']} close={c['close']:.2f}")
             except Exception as e:
-                logger.warning(f"Tick poll failed: {e}")
+                logger.warning(f"[tick] get_live_price failed: {e}")
 
-            # analysis cycle
+            # ── Real OHLCV candle ingest + higher-TF resample ────────────────
+            if (tnow - last_candle_poll) >= candle_poll_seconds:
+                last_candle_poll = tnow
+                try:
+                    new_ts = fetch_and_upsert_1m(
+                        session, engine, schema, epic, sentiment_cache,
+                        zero_vol_state=zero_vol_state,
+                    )
+                    if new_ts:
+                        resample_counts = resample_and_upsert(
+                            engine, schema, epic, new_ts,
+                        )
+                        total_resampled = sum(resample_counts.values())
+                        if total_resampled > 0:
+                            logger.info(
+                                "[resample] bars written: %s",
+                                " | ".join(
+                                    f"{tf}={n}"
+                                    for tf, n in resample_counts.items()
+                                ),
+                            )
+                except Exception as e:
+                    logger.warning(f"[ingest] Candle poll cycle failed: {e}")
+
+            # ── Analysis cycle ───────────────────────────────────────────────
             if (tnow - last_analysis) >= save_every:
                 last_analysis = tnow
                 try:

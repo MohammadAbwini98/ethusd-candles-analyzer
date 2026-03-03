@@ -180,7 +180,10 @@ def add_strategy_features(
     out["score_mr"] = out["score"]
     out["score_mom"] = out["log_ret"].ewm(span=mom_span, min_periods=mom_span).mean()
     out["volatility"] = out["log_ret"].rolling(vol_window, min_periods=vol_window).std(ddof=1)
-    out["rc"] = out["score_mr"].rolling(regime_corr_window, min_periods=regime_corr_window).corr(out["fwd_ret_1"])
+    # Past-only predictive correlation: at bar t, score_mr(t-1) is known and
+    # log_ret(t) is known at close.  No forward return is used — eliminates
+    # lookahead leakage from the live regime signal.
+    out["rc"] = out["score_mr"].shift(1).rolling(regime_corr_window, min_periods=regime_corr_window).corr(out["log_ret"])
     log_ret_lag1 = out["log_ret"].shift(1)
     out["ar"] = out["log_ret"].rolling(regime_corr_window, min_periods=regime_corr_window).corr(log_ret_lag1)
     for col in ["score_mom", "volatility", "rc", "ar"]:

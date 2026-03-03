@@ -12,6 +12,7 @@ capital:
   # Live polling intervals (seconds)
   tick_poll_seconds: 1
   sentiment_poll_seconds: 30
+  candle_poll_seconds: 65    # how often to fetch new closed 1m candles from /api/v1/prices (> 60s)
 
 db:
   host: localhost
