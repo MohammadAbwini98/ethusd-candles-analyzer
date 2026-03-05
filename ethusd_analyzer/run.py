@@ -15,7 +15,7 @@ import pandas as pd
 
 from typing import Any, Dict, Optional, Set
 
-from .utils import load_config, save_json, now_ts, send_alert, set_telegram_notifier, set_email_notifier, set_macos_notifier
+from .utils import load_config, save_json, now_ts, send_alert, set_telegram_notifier, set_email_notifier, set_macos_notifier, get_notification_tracker
 from .db import DbConfig, make_engine, fetch_candles
 from .analysis import add_features, add_strategy_features, resample_timeframe, correlation_table, lag_correlation, rolling_correlations
 from .storage import OutputConfig, init_schema_and_tables, save_snapshot, save_signal_recommendation, save_calibration_result, save_meta_model_run
@@ -904,9 +904,12 @@ def _send_startup_alert(symbol: str = "ETH", mode: str = "LIVE") -> None:
     if _telegram_notifier is not None:
         msg = TelegramNotifier.format_startup_message(symbol=symbol, mode=mode)
         try:
+            get_notification_tracker().record_attempt("telegram")
             _telegram_notifier.send_message(msg)
+            get_notification_tracker().record_success("telegram")
             logger.info("[startup_alert] Telegram notification sent")
         except Exception as e:
+            get_notification_tracker().record_error("telegram", str(e))
             logger.warning("[startup_alert] Failed to send Telegram: %s", e)
     
     # Email
@@ -914,22 +917,30 @@ def _send_startup_alert(symbol: str = "ETH", mode: str = "LIVE") -> None:
         subject, html_body = EmailNotifier.format_startup_message(symbol=symbol, mode=mode)
         try:
             import threading
-            threading.Thread(
-                target=_email_notifier.send_message,
-                args=(subject, html_body),
-                daemon=True,
-            ).start()
+            _em = _email_notifier  # capture for closure — Pyright can't narrow module globals
+            get_notification_tracker().record_attempt("email")
+            def _send_startup_email(_n: EmailNotifier = _em) -> None:
+                ok = _n.send_message(subject, html_body)
+                if ok:
+                    get_notification_tracker().record_success("email")
+                else:
+                    get_notification_tracker().record_error("email", "send_message returned False")
+            threading.Thread(target=_send_startup_email, daemon=True).start()
             logger.info("[startup_alert] Email notification sent")
         except Exception as e:
+            get_notification_tracker().record_error("email", str(e))
             logger.warning("[startup_alert] Failed to send Email: %s", e)
     
     # macOS
     if _macos_notifier is not None:
         title, message, subtitle = MacOSNotifier.format_startup_message(symbol=symbol, mode=mode)
         try:
+            get_notification_tracker().record_attempt("macos")
             _macos_notifier.notify(title, message, subtitle)
+            get_notification_tracker().record_success("macos")
             logger.info("[startup_alert] macOS notification sent")
         except Exception as e:
+            get_notification_tracker().record_error("macos", str(e))
             logger.warning("[startup_alert] Failed to send macOS: %s", e)
 
 
@@ -966,9 +977,12 @@ def _send_shutdown_alert(
             symbol=symbol, reason=reason, error_msg=error_msg
         )
         try:
+            get_notification_tracker().record_attempt("telegram")
             _telegram_notifier.send_message(msg)
+            get_notification_tracker().record_success("telegram")
             logger.info("[shutdown_alert] Telegram notification sent (reason=%s)", reason)
         except Exception as e:
+            get_notification_tracker().record_error("telegram", str(e))
             logger.warning("[shutdown_alert] Failed to send Telegram: %s", e)
     
     # Email
@@ -978,13 +992,18 @@ def _send_shutdown_alert(
         )
         try:
             import threading
-            threading.Thread(
-                target=_email_notifier.send_message,
-                args=(subject, html_body),
-                daemon=True,
-            ).start()
+            _em = _email_notifier  # capture for closure — Pyright can't narrow module globals
+            get_notification_tracker().record_attempt("email")
+            def _send_shutdown_email(_n: EmailNotifier = _em) -> None:
+                ok = _n.send_message(subject, html_body)
+                if ok:
+                    get_notification_tracker().record_success("email")
+                else:
+                    get_notification_tracker().record_error("email", "send_message returned False")
+            threading.Thread(target=_send_shutdown_email, daemon=True).start()
             logger.info("[shutdown_alert] Email notification sent (reason=%s)", reason)
         except Exception as e:
+            get_notification_tracker().record_error("email", str(e))
             logger.warning("[shutdown_alert] Failed to send Email: %s", e)
     
     # macOS (use sync to ensure it completes before exit)
@@ -993,9 +1012,12 @@ def _send_shutdown_alert(
             symbol=symbol, reason=reason, error_msg=error_msg
         )
         try:
+            get_notification_tracker().record_attempt("macos")
             _macos_notifier.notify_sync(title, message, subtitle)
+            get_notification_tracker().record_success("macos")
             logger.info("[shutdown_alert] macOS notification sent (reason=%s)", reason)
         except Exception as e:
+            get_notification_tracker().record_error("macos", str(e))
             logger.warning("[shutdown_alert] Failed to send macOS: %s", e)
 
 
@@ -1009,11 +1031,15 @@ def _register_signal_handlers(symbol: str = "ETH") -> None:
     - atexit  → last-resort flush in case Python skips the except handlers
     """
     def _on_sigint(signum, frame):
+        # Ignore any further Ctrl+C so a second press can't interrupt cleanup
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         logger.warning("[signal] SIGINT received — initiating graceful shutdown")
         _send_shutdown_alert(symbol=symbol, reason="SIGINT")
         raise KeyboardInterrupt()
 
     def _on_sigterm(signum, frame):
+        # Restore default so a second SIGTERM falls through without re-entering
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         logger.warning("[signal] SIGTERM received — initiating graceful shutdown")
         _send_shutdown_alert(symbol=symbol, reason="SIGTERM")
         raise SystemExit(128 + 15)  # conventional SIGTERM exit code
@@ -1130,12 +1156,23 @@ def main():
     dash_raw = cfg.raw.get("dashboard", {})
     dash = None
     if bool(dash_raw.get("enabled", True)):
+        alerts_cfg_for_dash = cfg.raw.get("alerts", {})
+        _notifiers_for_dash = {
+            "telegram": _telegram_notifier,
+            "email": _email_notifier,
+            "macos": _macos_notifier,
+            "wa_url": alerts_cfg_for_dash.get("whatsapp_notifier_url", "http://127.0.0.1:3099/send"),
+            "wa_enabled": alerts_cfg_for_dash.get("enabled", False),
+        }
         dash = DashboardServer(
             engine=engine,
             schema=out_cfg.schema,
             host=str(dash_raw.get("host","127.0.0.1")),
             port=int(dash_raw.get("port",8787)),
             open_browser=bool(dash_raw.get("open_browser", True)),
+            notification_tracker=get_notification_tracker(),
+            notifiers=_notifiers_for_dash,
+            cfg_raw=cfg.raw,
         )
         dash.start()
 

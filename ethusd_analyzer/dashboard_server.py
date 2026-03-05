@@ -9,6 +9,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 import json
 import math
 import webbrowser
@@ -44,12 +45,25 @@ def _sanitize(obj: object) -> object:
 
 
 class DashboardServer:
-    def __init__(self, engine: Engine, schema: str, host: str, port: int, open_browser: bool = True):
+    def __init__(
+        self,
+        engine: Engine,
+        schema: str,
+        host: str,
+        port: int,
+        open_browser: bool = True,
+        notification_tracker: Optional[Any] = None,
+        notifiers: Optional[Dict[str, Any]] = None,
+        cfg_raw: Optional[Dict[str, Any]] = None,
+    ):
         self.engine = engine
         self.schema = schema
         self.host = host
         self.port = port
         self.open_browser = open_browser
+        self.notification_tracker = notification_tracker
+        self.notifiers: Dict[str, Any] = notifiers or {}
+        self.cfg_raw: Dict[str, Any] = cfg_raw or {}
         self._thread = None
         self._httpd = None
         self._static_dir = Path(__file__).parent / "static"
@@ -108,7 +122,11 @@ class DashboardServer:
 
     def stop(self):
         if self._httpd:
-            self._httpd.shutdown()
+            # Run shutdown() in a daemon thread so a second SIGINT during
+            # cleanup cannot raise KeyboardInterrupt inside threading internals.
+            t = threading.Thread(target=self._httpd.shutdown, daemon=True)
+            t.start()
+            t.join(timeout=3)  # wait up to 3 s; abandon if still blocked
 
     def _make_handler(self):
         engine = self.engine
@@ -177,10 +195,143 @@ class DashboardServer:
                     payload = server_ref.live_price or {"price": None}
                     return self._send(200, json.dumps(payload, default=str).encode("utf-8"), "application/json")
 
+                if path == "/api/health":
+                    tracker = server_ref.notification_tracker
+                    notifs = server_ref.notifiers
+
+                    # WhatsApp sidecar connectivity probe
+                    wa_url = notifs.get("wa_url", "")
+                    wa_health: Dict[str, Any] = {"enabled": notifs.get("wa_enabled", False)}
+                    if wa_health["enabled"] and wa_url:
+                        health_url = wa_url.rsplit("/", 1)[0] + "/health"
+                        try:
+                            import requests as _req
+                            resp = _req.get(health_url, timeout=2)
+                            data = resp.json()
+                            wa_health["reachable"] = True
+                            wa_health["ready"] = data.get("ready", False)
+                            wa_health["clients"] = data.get("clients")
+                        except Exception as exc:
+                            wa_health["reachable"] = False
+                            wa_health["error"] = str(exc)[:100]
+
+                    notif_status = tracker.get_status() if tracker is not None else {}
+                    payload = {
+                        "dashboard": "ok",
+                        "whatsapp_sidecar": wa_health,
+                        "notifications_status": notif_status,
+                        "channels": {
+                            "telegram": notifs.get("telegram") is not None,
+                            "email": notifs.get("email") is not None,
+                            "macos": notifs.get("macos") is not None and getattr(notifs.get("macos"), "enabled", False),
+                            "whatsapp": notifs.get("wa_enabled", False),
+                        },
+                    }
+                    return self._send(200, json.dumps(payload, default=str).encode("utf-8"), "application/json")
+
                 return self._send(404, b"Not found", "text/plain")
 
             def log_message(self, format, *args):
                 return
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                path = parsed.path
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+                if path == "/api/notify/test":
+                    return self._handle_notify_test()
+
+                return self._send(404, b"Not found", "text/plain")
+
+            def _handle_notify_test(self) -> None:
+                notifs = server_ref.notifiers
+                tracker = server_ref.notification_tracker
+                test_msg = (
+                    "\U0001f514 ETH Analyzer \u2014 Test notification via /api/notify/test"
+                )
+                results: Dict[str, Any] = {}
+
+                # WhatsApp
+                wa_url = notifs.get("wa_url", "")
+                wa_enabled = notifs.get("wa_enabled", False)
+                if wa_enabled and wa_url:
+                    if tracker:
+                        tracker.record_attempt("whatsapp")
+                    try:
+                        import requests as _req
+                        resp = _req.post(wa_url, json={"message": test_msg}, timeout=3)
+                        results["whatsapp"] = {"ok": resp.status_code < 400, "status": resp.status_code}
+                        if tracker:
+                            if resp.status_code < 400:
+                                tracker.record_success("whatsapp")
+                            else:
+                                tracker.record_error("whatsapp", f"HTTP {resp.status_code}")
+                    except Exception as exc:
+                        results["whatsapp"] = {"ok": False, "error": str(exc)[:200]}
+                        if tracker:
+                            tracker.record_error("whatsapp", str(exc)[:200])
+                else:
+                    results["whatsapp"] = {"ok": False, "skipped": "alerts.enabled=false or no wa_url"}
+
+                # Telegram
+                tg = notifs.get("telegram")
+                if tg is not None:
+                    if tracker:
+                        tracker.record_attempt("telegram")
+                    try:
+                        tg_results = tg.send_message(test_msg)
+                        success = any(r is not None for r in tg_results.values())
+                        results["telegram"] = {"ok": success, "recipients": len(tg_results)}
+                        if tracker:
+                            (tracker.record_success if success else tracker.record_error)("telegram", "no chat delivered")
+                    except Exception as exc:
+                        results["telegram"] = {"ok": False, "error": str(exc)[:200]}
+                        if tracker:
+                            tracker.record_error("telegram", str(exc)[:200])
+                else:
+                    results["telegram"] = {"ok": False, "skipped": "not configured"}
+
+                # Email
+                em = notifs.get("email")
+                if em is not None:
+                    if tracker:
+                        tracker.record_attempt("email")
+                    try:
+                        html_body = f"<html><body><p>{test_msg}</p></body></html>"
+                        ok = em.send_message("\U0001f514 Test Notification", html_body)
+                        results["email"] = {"ok": ok}
+                        if tracker:
+                            (tracker.record_success if ok else tracker.record_error)("email", "send_message returned False")
+                    except Exception as exc:
+                        results["email"] = {"ok": False, "error": str(exc)[:200]}
+                        if tracker:
+                            tracker.record_error("email", str(exc)[:200])
+                else:
+                    results["email"] = {"ok": False, "skipped": "not configured"}
+
+                # macOS
+                mac = notifs.get("macos")
+                if mac is not None and getattr(mac, "enabled", False):
+                    if tracker:
+                        tracker.record_attempt("macos")
+                    try:
+                        mac.notify("\U0001f514 Test", test_msg)
+                        results["macos"] = {"ok": True}
+                        if tracker:
+                            tracker.record_success("macos")
+                    except Exception as exc:
+                        results["macos"] = {"ok": False, "error": str(exc)[:200]}
+                        if tracker:
+                            tracker.record_error("macos", str(exc)[:200])
+                else:
+                    results["macos"] = {"ok": False, "skipped": "disabled or not on macOS"}
+
+                any_ok = any(v.get("ok") for v in results.values())
+                status_code = 200 if any_ok else 503
+                payload = {"test_message": test_msg, "results": results, "any_delivered": any_ok}
+                return self._send(status_code, json.dumps(payload).encode("utf-8"), "application/json")
 
         return Handler
 

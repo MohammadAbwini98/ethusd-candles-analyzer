@@ -423,13 +423,11 @@ def get_macos_notifier(cfg: Dict[str, Any]) -> Optional[MacOSNotifier]:
     """
     alerts_cfg = cfg.get("alerts", {})
     macos_cfg = alerts_cfg.get("macos", {})
-    
-    if not alerts_cfg.get("enabled", False):
-        logger.debug("[macos] Alerts disabled globally")
-        return None
-    
+
+    # Each channel is controlled by its own enabled flag.
+    # The top-level alerts.enabled only gates WhatsApp (the sidecar).
     if not macos_cfg.get("enabled", False):
-        logger.debug("[macos] Disabled via config (or not on macOS)")
+        logger.debug("[macos] Disabled via config (macos.enabled=false)")
         return None
     
     try:

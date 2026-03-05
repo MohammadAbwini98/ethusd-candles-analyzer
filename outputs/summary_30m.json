@@ -1,9 +1,9 @@
 {
   "timeframe": "30m",
-  "rows": 1425,
-  "start": "2026-02-01 17:00:00+00:00",
-  "end": "2026-03-03 17:00:00+00:00",
-  "latest_close": 1976.565,
-  "latest_score": -0.20976844085938476,
-  "buyers_plus_sellers_mean_abs_diff": 1.2166486142137855e-15
+  "rows": 1430,
+  "start": "2026-02-03 20:30:00+00:00",
+  "end": "2026-03-05 23:00:00+00:00",
+  "latest_close": 2083.355,
+  "latest_score": -0.035105481345981904,
+  "buyers_plus_sellers_mean_abs_diff": 1.460836114080206e-15
 }

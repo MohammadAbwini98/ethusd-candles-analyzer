@@ -346,9 +346,11 @@ def get_email_notifier(cfg: Dict[str, Any]) -> Optional[EmailNotifier]:
     """
     alerts_cfg = cfg.get("alerts", {})
     email_cfg = alerts_cfg.get("email", {})
-    
-    if not alerts_cfg.get("enabled", False) or not email_cfg.get("enabled", False):
-        logger.debug("[email] Disabled via config")
+
+    # Each channel is controlled by its own enabled flag.
+    # The top-level alerts.enabled only gates WhatsApp (the sidecar).
+    if not email_cfg.get("enabled", False):
+        logger.debug("[email] Disabled via config (email.enabled=false)")
         return None
     
     # Resolve password from env var

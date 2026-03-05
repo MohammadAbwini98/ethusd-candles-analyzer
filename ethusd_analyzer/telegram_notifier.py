@@ -333,9 +333,11 @@ def get_telegram_notifier(cfg: Dict[str, Any]) -> Optional[TelegramNotifier]:
     """
     alerts_cfg = cfg.get("alerts", {})
     tg_cfg = alerts_cfg.get("telegram", {})
-    
-    if not alerts_cfg.get("enabled", False) or not tg_cfg.get("enabled", False):
-        logger.debug("[telegram] Disabled via config")
+
+    # Each channel is controlled by its own enabled flag.
+    # The top-level alerts.enabled only gates WhatsApp (the sidecar).
+    if not tg_cfg.get("enabled", False):
+        logger.debug("[telegram] Disabled via config (telegram.enabled=false)")
         return None
     
     # Resolve bot token: env var first, then config, then None
