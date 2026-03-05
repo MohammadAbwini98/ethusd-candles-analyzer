@@ -48,8 +48,9 @@ notifier/.wwebjs_cache/
 notifier/session*
 session*/
 
-# Output files (large CSVs, generated reports)
+# Output files (large CSVs, generated reports, summary JSONs)
 outputs/*.csv
+outputs/*.json
 
 # Logs
 *.log
