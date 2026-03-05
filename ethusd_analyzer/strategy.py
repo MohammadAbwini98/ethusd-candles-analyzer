@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -71,6 +72,12 @@ class CalibrationResult:
     max_trades_seen: int = 0            # FR-19
     best_dd_seen: float = 0.0           # FR-19 (lowest max_dd observed; 0.0 = no trades, not 1.0)
     rejection_reason: Optional[str] = None
+    # Walk-forward OOS aggregate fields (populated only when walk_forward_folds > 1)
+    folds_used: int = 0                # number of OOS folds whose results were aggregated
+    oos_trades: int = 0                # total OOS trades summed across folds
+    oos_win_rate: float = 0.0          # trade-weighted OOS win rate across folds
+    worst_fold_dd: float = 0.0         # worst single-fold OOS drawdown
+    rejected_oos_folds: int = 0        # candidates rejected for <min_folds_with_trades valid OOS folds
 
 
 # ── Cooldown / Dedup ─────────────────────────────────────────
@@ -181,6 +188,127 @@ def generate_signal(
         return Signal.NO_SIGNAL
     return Signal.NO_SIGNAL
 
+# ── Step 2b: Price Confirmation Gates ─────────────────────────────
+
+def _check_price_gates(
+    regime: Regime,
+    signal: Signal,
+    price_z: float,
+    trend_strength: float,
+    stretch_z_min: float = 0.0,
+    trend_min: float = 0.0,
+) -> Tuple[bool, str]:
+    """Return (passes_gate, reason_snippet).
+
+    When both thresholds are 0 (default) the gate is fully disabled and always
+    returns True.  NaN inputs count as a gate failure when the threshold is > 0.
+    """
+    if regime == Regime.MR and stretch_z_min > 0.0:
+        if np.isnan(price_z):
+            return False, "MR gate failed: price_z=NaN (insufficient history)"
+        if signal == Signal.BUY and price_z > -stretch_z_min:
+            return False, f"MR gate failed: price_z={price_z:.3f} (need <= {-stretch_z_min:.3f})"
+        if signal == Signal.SELL and price_z < stretch_z_min:
+            return False, f"MR gate failed: price_z={price_z:.3f} (need >= {stretch_z_min:.3f})"
+    if regime == Regime.MOM and trend_min > 0.0:
+        if np.isnan(trend_strength):
+            return False, "MOM gate failed: trend_strength=NaN (insufficient history)"
+        if signal == Signal.BUY and trend_strength < trend_min:
+            return False, f"MOM gate failed: trend_strength={trend_strength:.6f} (need >= {trend_min:.6f})"
+        if signal == Signal.SELL and trend_strength > -trend_min:
+            return False, f"MOM gate failed: trend_strength={trend_strength:.6f} (need <= {-trend_min:.6f})"
+    return True, ""
+
+# ── Step 3: Meta-Model Gate (optional ML filter) ─────────────────────────────
+
+# Module-level in-memory model cache: {timeframe: {"model": pipeline, "path": str}}
+_META_MODEL_CACHE: Dict[str, Any] = {}
+
+# Order matches FEATURE_NAMES in meta_trainer.py — must stay in sync.
+_META_FEATURE_NAMES: List[str] = [
+    "rc", "ar", "score_mr", "score_mom", "volatility",
+    "conf_regime", "conf_tail", "conf_backtest",
+    "price_z", "trend_strength",
+    "regime_mr", "signal_buy",
+    "q_hi", "q_lo",
+    "score_mr_minus_qhi", "score_mr_minus_qlo",
+    "hold_bars",
+]
+
+
+def _build_meta_features(
+    rc: float, ar: float, score_mr: float, score_mom: float, volatility: float,
+    c_regime: float, c_tail: float, c_backtest: float,
+    price_z: float, trend_strength: float,
+    regime: Regime, signal: Signal,
+    q_hi: float, q_lo: float, hold_bars: int,
+) -> List[float]:
+    """Return a feature vector matching FEATURE_NAMES in meta_trainer.py."""
+    def _s(v: float) -> float:
+        try:
+            f = float(v)  # type: ignore[arg-type]
+            return 0.0 if (np.isnan(f) or np.isinf(f)) else f
+        except (TypeError, ValueError):
+            return 0.0
+    smr = _s(score_mr)
+    qhi, qlo = _s(q_hi), _s(q_lo)
+    return [
+        _s(rc), _s(ar), smr, _s(score_mom), _s(volatility),
+        _s(c_regime), _s(c_tail), _s(c_backtest),
+        _s(price_z), _s(trend_strength),
+        1.0 if regime == Regime.MR  else 0.0,
+        1.0 if signal == Signal.BUY else 0.0,
+        qhi, qlo,
+        smr - qhi, smr - qlo,
+        float(hold_bars),
+    ]
+
+
+def _meta_predict(
+    timeframe: str,
+    features: List[float],
+    meta_cfg: Dict[str, Any],
+) -> Optional[float]:
+    """Load model for *timeframe* (cached), return P(WIN) or None on failure.
+
+    Returns None (= gate disabled) when the model artifact does not exist.
+    Never raises.
+    """
+    path_override = meta_cfg.get("model_path_per_timeframe", {}).get(timeframe)
+    model_dir     = meta_cfg.get("model_dir", "outputs/models")
+    model_path    = path_override or str(Path(model_dir) / f"meta_{timeframe}.joblib")
+
+    cached = _META_MODEL_CACHE.get(timeframe)
+    if cached is None or cached.get("path") != model_path:
+        if not Path(model_path).exists():
+            return None   # model not yet trained — silent pass-through
+        try:
+            import joblib  # type: ignore
+            pipeline = joblib.load(model_path)
+            _META_MODEL_CACHE[timeframe] = {"model": pipeline, "path": model_path}
+        except Exception as exc:
+            logger.warning("[meta_model][%s] Load failed (%s): %s", timeframe, model_path, exc)
+            return None
+
+    pipeline = _META_MODEL_CACHE.get(timeframe, {}).get("model")
+    if pipeline is None:
+        return None
+
+    try:
+        X = np.array(features, dtype=np.float64).reshape(1, -1)
+        return float(pipeline.predict_proba(X)[0, 1])
+    except Exception as exc:
+        logger.warning("[meta_model][%s] predict_proba failed: %s", timeframe, exc)
+        return None
+
+
+def invalidate_meta_model_cache(timeframe: Optional[str] = None) -> None:
+    """Force model reload on next prediction (call after retraining)."""
+    if timeframe is None:
+        _META_MODEL_CACHE.clear()
+    else:
+        _META_MODEL_CACHE.pop(timeframe, None)
+
 
 # ── Step 4: TP / SL ─────────────────────────────────────────
 
@@ -276,6 +404,8 @@ def _simulate_strategy(
     hold_bars: int,
     cost_bps: int,
     mom_k: float = 1.5,
+    stretch_z_min: float = 0.0,   # price gate: |price_z| min (0 = disabled)
+    trend_min: float = 0.0,        # trend gate: |trend_strength| min (0 = disabled)
 ) -> Tuple[float, float, float, int, float]:
     """Simulate strategy over historical data, return (sharpe, return, max_dd, n_trades, win_rate)."""
     n = len(df)
@@ -289,6 +419,9 @@ def _simulate_strategy(
     score_mr_arr = df["score_mr"].values
     score_mom_arr = df["score_mom"].values
     fwd_ret_arr = df["fwd_ret_1"].values
+    # Gate arrays — NaN fill when columns absent (gates disabled with threshold=0)
+    price_z_arr = df["price_z"].values if "price_z" in df.columns else np.full(n, np.nan)
+    trend_str_arr = df["trend_strength"].values if "trend_strength" in df.columns else np.full(n, np.nan)
 
     # Pre-compute rolling quantiles
     score_mr_series = df["score_mr"]
@@ -341,6 +474,18 @@ def _simulate_strategy(
             _dbg_no_signal += 1
             i += 1
             continue
+
+        # Price gate check (fast-path: skipped when both thresholds are 0)
+        if stretch_z_min > 0.0 or trend_min > 0.0:
+            gate_ok, _ = _check_price_gates(
+                regime, signal,
+                float(price_z_arr[i]), float(trend_str_arr[i]),
+                stretch_z_min, trend_min,
+            )
+            if not gate_ok:
+                _dbg_no_signal += 1
+                i += 1
+                continue
 
         # Accumulate PnL over hold_bars
         trade_ret = 0.0
@@ -423,6 +568,10 @@ def run_calibration(
     min_trades: int = 20,
     walk_forward_folds: int = 1,          # FR-22: rolling walk-forward folds (1 = IS/OOS split)
     per_tf_overrides: Optional[Dict[str, Any]] = None,  # FR-18: per-timeframe param overrides
+    stretch_z_min: float = 0.0,           # price gate threshold (0 = disabled)
+    trend_min: float = 0.0,               # trend gate threshold (0 = disabled)
+    min_trades_oos: int = 0,              # WF: min OOS trades per fold to count as valid (0=auto)
+    min_folds_with_trades: int = 1,       # WF: min folds with valid OOS trades to accept a candidate
 ) -> CalibrationResult:
     """Walk-forward grid-search calibration with in-sample / out-of-sample split.
 
@@ -456,6 +605,12 @@ def run_calibration(
             max_drawdown = float(per_tf_overrides["max_drawdown"])
         if "lookback_days" in per_tf_overrides:
             lookback_days = int(per_tf_overrides["lookback_days"])
+        if "walk_forward_folds" in per_tf_overrides:
+            walk_forward_folds = int(per_tf_overrides["walk_forward_folds"])
+        if "min_trades_oos" in per_tf_overrides:
+            min_trades_oos = int(per_tf_overrides["min_trades_oos"])
+        if "min_folds_with_trades" in per_tf_overrides:
+            min_folds_with_trades = int(per_tf_overrides["min_folds_with_trades"])
 
     # Apply lookback window
     if "market_time" in df.columns and lookback_days > 0:
@@ -492,6 +647,9 @@ def run_calibration(
         return _run_walk_forward_calibration(
             df_cal, timeframe, grid, grid_size, cost_bps_default,
             max_drawdown, lookback_days, min_trades, effective_folds,
+            min_trades_oos=min_trades_oos,
+            min_folds_with_trades=min_folds_with_trades,
+            stretch_z_min=stretch_z_min, trend_min=trend_min,
         )
 
     # ── Single IS / OOS split (classic) ──────────────────────────────────────
@@ -515,6 +673,7 @@ def run_calibration(
         q_lo_pct = q_levels[1]
         sharpe, total_ret, max_dd, n_trades, win_rate = _simulate_strategy(
             df_is, r_min, r_min, q_window, q_hi_pct, q_lo_pct, hold_bars, cost_bps,
+            stretch_z_min=stretch_z_min, trend_min=trend_min,
         )
         # FR-19: track observed extremes
         max_trades_seen = max(max_trades_seen, n_trades)
@@ -601,6 +760,7 @@ def run_calibration(
         best_params["quantile_window"],
         best_params["quantile_hi"], best_params["quantile_lo"],
         best_params["hold_bars"], best_params["cost_bps"],
+        stretch_z_min=stretch_z_min, trend_min=trend_min,
     )
 
     # Report OOS metrics (use OOS for final metrics — more honest)
@@ -651,74 +811,143 @@ def _run_walk_forward_calibration(
     lookback_days: int,
     min_trades: int,
     n_folds: int,
+    min_trades_oos: int = 0,
+    min_folds_with_trades: int = 1,
+    stretch_z_min: float = 0.0,
+    trend_min: float = 0.0,
 ) -> CalibrationResult:
-    """FR-22: Expanding-window walk-forward calibration with *n_folds* OOS periods.
+    """Expanding-window walk-forward calibration — candidate-centric OOS selection.
 
+    Algorithm
+    ─────────
     Divides df_cal into (n_folds + 1) equal chunks.  For fold i (0-indexed):
-      IS  = chunks[0 .. i]
+      IS  = chunks[0 .. i]   (expanding)
       OOS = chunks[i+1]
-    The best params found on the *last* IS fold are returned; OOS metrics are
-    averaged across all folds that produced ≥2 trades.
+
+    For *each candidate* in the parameter grid:
+      1. Run IS simulation per fold (pre-filter: IS n_trades >= min_trades AND
+         IS max_dd <= max_drawdown).
+      2. For folds that pass IS, run OOS simulation.
+      3. Count folds with oos_trades >= max(2, min_trades_oos).
+      4. Accept candidate only when valid_folds >= min_folds_with_trades.
+      5. Aggregate: mean_oos_sharpe (primary), mean_oos_return (tie-break),
+         worst-fold drawdown (tie-break).
+
+    Best params = candidate with highest (mean_oos_sharpe, mean_oos_ret, −worst_fold_dd).
+    Returned CalibrationResult carries true OOS metrics (n_trades, win_rate, max_dd ≠ 0).
     """
     chunk_size = max(len(df_cal) // (n_folds + 1), 50)
-    all_oos_sharpes: List[float] = []
-    all_oos_rets: List[float] = []
-    last_best_params: Dict[str, Any] = {}
-    last_eligible = 0
+
+    # ── Build expanding IS / OOS windows ───────────────────────────────────
+    folds: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
+    for fold_i in range(n_folds):
+        is_end  = chunk_size * (fold_i + 1)
+        oos_end = chunk_size * (fold_i + 2)
+        df_is_f  = df_cal.iloc[:is_end ].copy().reset_index(drop=True)
+        df_oos_f = df_cal.iloc[is_end:oos_end].copy().reset_index(drop=True)
+        if len(df_is_f) >= 100 and len(df_oos_f) >= 10:
+            folds.append((df_is_f, df_oos_f))
+
+    n_valid_folds = len(folds)
+    if n_valid_folds < 1:
+        return CalibrationResult(
+            timeframe=timeframe,
+            best_params=_default_params(cost_bps_default),
+            net_sharpe=0.0, net_return=0.0, max_drawdown=0.0,
+            n_trades=0, win_rate=0.0,
+            param_grid_size=grid_size, lookback_days=lookback_days,
+            status="INSUFFICIENT_DATA",
+            min_trades_used=min_trades, max_dd_used=max_drawdown,
+            eligible_candidates=0, total_candidates=grid_size,
+            rejection_reason=(
+                f"Walk-forward ({n_folds} folds): not enough data "
+                f"(chunk_size={chunk_size} bars, 0 valid folds)"
+            ),
+        )
+
+    # Effective fold threshold — cannot exceed the folds we actually have
+    _eff_min_folds = max(1, min(min_folds_with_trades, n_valid_folds))
+    # Effective per-fold OOS min trades (floor at 2 to always require real activity)
+    _eff_oos_mt = max(2, min_trades_oos)
+
+    # ── Candidate-centric OOS evaluation ───────────────────────────────────
+    best_objective: Tuple[float, float, float] = (-np.inf, -np.inf, np.inf)
+    best_params: Dict[str, Any] = {}
+    best_oos_agg: Optional[Tuple[float, float, float, int, float, int]] = None
+    eligible_count = 0
+    rejected_oos_folds_count = 0
+    # IS rejection counters aggregate across all fold×candidate evaluations
     rejected_mt = rejected_dd = rejected_both = 0
     max_trades_seen = 0
     best_dd_seen = float("inf")
 
-    for fold_i in range(n_folds):
-        is_end = chunk_size * (fold_i + 1)
-        oos_end = chunk_size * (fold_i + 2)
-        df_is_f = df_cal.iloc[:is_end].copy().reset_index(drop=True)
-        df_oos_f = df_cal.iloc[is_end:oos_end].copy().reset_index(drop=True)
-        if len(df_is_f) < 100 or len(df_oos_f) < 10:
-            continue
+    for r_min, q_window, q_levels, hold_bars, cost_bps in grid:
+        q_hi, q_lo = float(q_levels[0]), float(q_levels[1])
+        fold_oos: List[Tuple[float, float, float, int, float]] = []
 
-        best_t: tuple = (-np.inf, -np.inf, np.inf)
-        bp: Dict[str, Any] = {}
-        elig = 0
-        for r_min, q_window, q_levels, hold_bars, cost_bps in grid:
-            sh, tr, dd, nt, wr = _simulate_strategy(
-                df_is_f, r_min, r_min, q_window, q_levels[0], q_levels[1], hold_bars, cost_bps,
+        for df_is_f, df_oos_f in folds:
+            # IS evaluation — tracking + pre-filter
+            is_sh, is_ret, is_dd, is_nt, is_wr = _simulate_strategy(
+                df_is_f, r_min, r_min, q_window, q_hi, q_lo, hold_bars, cost_bps,
+                stretch_z_min=stretch_z_min, trend_min=trend_min,
             )
-            max_trades_seen = max(max_trades_seen, nt)
-            if dd < best_dd_seen:
-                best_dd_seen = dd
-            if nt < min_trades and dd > max_drawdown:
-                rejected_both += 1; continue
-            if nt < min_trades:
-                rejected_mt += 1; continue
-            if dd > max_drawdown:
-                rejected_dd += 1; continue
-            elig += 1
-            t = (sh, tr, -dd)
-            if t > best_t:
-                best_t = t
-                bp = {"r_min": r_min, "quantile_window": q_window, "quantile_hi": q_levels[0],
-                      "quantile_lo": q_levels[1], "hold_bars": hold_bars, "cost_bps": cost_bps}
-        last_eligible = elig
-        if bp:
-            last_best_params = bp
-            oos_sh, oos_tr, _, oos_nt, _ = _simulate_strategy(
-                df_oos_f, bp["r_min"], bp["r_min"], bp["quantile_window"],
-                bp["quantile_hi"], bp["quantile_lo"], bp["hold_bars"], bp["cost_bps"],
+            max_trades_seen = max(max_trades_seen, is_nt)
+            if is_dd < best_dd_seen:
+                best_dd_seen = is_dd
+            fails_mt = is_nt < min_trades
+            fails_dd = is_dd > max_drawdown
+            if fails_mt and fails_dd:
+                rejected_both += 1
+                continue
+            if fails_mt:
+                rejected_mt += 1
+                continue
+            if fails_dd:
+                rejected_dd += 1
+                continue
+
+            # OOS evaluation for this fold
+            oos_sh, oos_ret, oos_dd, oos_nt, oos_wr = _simulate_strategy(
+                df_oos_f, r_min, r_min, q_window, q_hi, q_lo, hold_bars, cost_bps,
+                stretch_z_min=stretch_z_min, trend_min=trend_min,
             )
             if oos_nt >= 2 and not np.isnan(oos_sh) and oos_sh > -999.0:
-                all_oos_sharpes.append(oos_sh)
-                all_oos_rets.append(oos_tr)
+                fold_oos.append((oos_sh, oos_ret, oos_dd, oos_nt, oos_wr))
+
+        # ── OOS aggregation & constraints ──────────────────────────────────
+        folds_meeting_mt = sum(1 for r in fold_oos if r[3] >= _eff_oos_mt)
+        if len(fold_oos) < _eff_min_folds or folds_meeting_mt < _eff_min_folds:
+            rejected_oos_folds_count += 1
+            continue
+
+        mean_sh      = float(np.mean([r[0] for r in fold_oos]))
+        mean_ret     = float(np.mean([r[1] for r in fold_oos]))
+        worst_dd     = float(max(r[2] for r in fold_oos))
+        total_trades = int(sum(r[3] for r in fold_oos))
+        wt_wr        = float(sum(r[4] * r[3] for r in fold_oos) / max(total_trades, 1))
+        eligible_count += 1
+        obj = (mean_sh, mean_ret, -worst_dd)
+        if obj > best_objective:
+            best_objective = obj
+            best_params = {
+                "r_min": r_min, "quantile_window": q_window,
+                "quantile_hi": q_hi, "quantile_lo": q_lo,
+                "hold_bars": hold_bars, "cost_bps": cost_bps,
+            }
+            best_oos_agg = (mean_sh, mean_ret, worst_dd, total_trades, wt_wr, len(fold_oos))
 
     if best_dd_seen == float("inf"):
-        best_dd_seen = 0.0  # no trades executed → drawdown is 0.0, not 1.0
+        best_dd_seen = 0.0
 
-    if not last_best_params:
+    # ── No valid candidates ─────────────────────────────────────────────────
+    if best_oos_agg is None:
         reason = (
-            f"Walk-forward ({n_folds} folds) — no valid params across any fold. "
-            f"rej_mt={rejected_mt} rej_dd={rejected_dd} rej_both={rejected_both}"
+            f"Walk-forward ({n_folds} folds, {n_valid_folds} valid) — no eligible candidates. "
+            f"IS: rej_mt={rejected_mt} rej_dd={rejected_dd} rej_both={rejected_both}. "
+            f"OOS: rej_folds={rejected_oos_folds_count} "
+            f"(need >={_eff_min_folds} folds with >={_eff_oos_mt} OOS trades each)."
         )
-        logger.warning(f"[calibration][{timeframe}] NO_VALID_PARAMS: {reason}")
+        logger.warning("[calibration][%s] NO_VALID_PARAMS: %s", timeframe, reason)
         return CalibrationResult(
             timeframe=timeframe,
             best_params=_default_params(cost_bps_default),
@@ -731,30 +960,50 @@ def _run_walk_forward_calibration(
             rejected_by_min_trades=rejected_mt, rejected_by_max_dd=rejected_dd,
             rejected_by_both=rejected_both,
             max_trades_seen=max_trades_seen, best_dd_seen=best_dd_seen,
+            rejected_oos_folds=rejected_oos_folds_count,
             rejection_reason=reason,
         )
 
-    avg_sharpe = float(np.mean(all_oos_sharpes)) if all_oos_sharpes else 0.0
-    avg_ret = float(np.mean(all_oos_rets)) if all_oos_rets else 0.0
+    mean_sh, mean_ret, worst_dd, total_trades, wt_wr, folds_used = best_oos_agg
     logger.info(
-        f"[calibration][{timeframe}] walk-forward({n_folds}) avg_oos_sharpe={avg_sharpe:.3f} "
-        f"folds_with_trades={len(all_oos_sharpes)}/{n_folds} eligible_last={last_eligible}/{grid_size}"
+        "[calibration][%s] WF folds=%d valid=%d candidates=%d eligible=%d "
+        "pass_folds>=%d: %d | "
+        "best: r_min=%.2f q_win=%d hold=%d cost=%d "
+        "mean_oos_sharpe=%.3f mean_oos_ret=%.4f worst_oos_dd=%.4f "
+        "oos_trades=%d win=%.0f%% | "
+        "IS: rej_mt=%d rej_dd=%d rej_both=%d OOS_rej_folds=%d",
+        timeframe, n_folds, n_valid_folds, grid_size, eligible_count,
+        _eff_min_folds, eligible_count,
+        best_params["r_min"], best_params["quantile_window"],
+        best_params["hold_bars"], best_params["cost_bps"],
+        mean_sh, mean_ret, worst_dd, total_trades, wt_wr * 100,
+        rejected_mt, rejected_dd, rejected_both, rejected_oos_folds_count,
     )
     return CalibrationResult(
         timeframe=timeframe,
-        best_params=last_best_params,
-        net_sharpe=avg_sharpe,
-        net_return=avg_ret,
-        max_drawdown=0.0,
-        n_trades=0, win_rate=0.0,
+        best_params=best_params,
+        net_sharpe=mean_sh,
+        net_return=mean_ret,
+        max_drawdown=worst_dd,
+        n_trades=total_trades,
+        win_rate=wt_wr,
         param_grid_size=grid_size,
         lookback_days=lookback_days,
         status="OK",
-        min_trades_used=min_trades, max_dd_used=max_drawdown,
-        eligible_candidates=last_eligible, total_candidates=grid_size,
-        rejected_by_min_trades=rejected_mt, rejected_by_max_dd=rejected_dd,
+        min_trades_used=min_trades,
+        max_dd_used=max_drawdown,
+        eligible_candidates=eligible_count,
+        total_candidates=grid_size,
+        rejected_by_min_trades=rejected_mt,
+        rejected_by_max_dd=rejected_dd,
         rejected_by_both=rejected_both,
-        max_trades_seen=max_trades_seen, best_dd_seen=best_dd_seen,
+        max_trades_seen=max_trades_seen,
+        best_dd_seen=best_dd_seen,
+        folds_used=folds_used,
+        oos_trades=total_trades,
+        oos_win_rate=wt_wr,
+        worst_fold_dd=worst_dd,
+        rejected_oos_folds=rejected_oos_folds_count,
     )
 
 
@@ -802,6 +1051,11 @@ def evaluate_timeframe(
     last = df_feat.iloc[-1]
     rc_val = float(last["rc"]) if not np.isnan(float(last["rc"])) else float("nan")
     ar_val = float(last["ar"]) if not np.isnan(float(last["ar"])) else float("nan")
+    
+    logger.debug(
+        "[eval][%s] Starting evaluation: rows=%d rc=%.4f ar=%.4f cal_params=%s",
+        timeframe, len(df_feat), rc_val, ar_val, "present" if calibration_params else "MISSING"
+    )
 
     # Step 1: Regime (with optional K-of-M persistence — FR-09)
     if regime_history is not None and persistence_k > 1 and persistence_m > 1:
@@ -811,6 +1065,10 @@ def evaluate_timeframe(
     else:
         regime = detect_regime(rc_val, ar_val, r_min, a_min)
     if regime == Regime.NO_TRADE:
+        logger.debug(
+            "[eval][%s] FILTERED at regime: NO_TRADE (rc=%.4f vs r_min=%.4f, ar=%.4f vs a_min=%.4f)",
+            timeframe, rc_val, r_min, ar_val, a_min
+        )
         return None
 
     # Step 2: Thresholds + signal (enforce min_bars >= q_window)
@@ -835,11 +1093,42 @@ def evaluate_timeframe(
         q_hi_val, q_lo_val, mom_threshold,
     )
     if signal == Signal.NO_SIGNAL:
+        if regime == Regime.MR:
+            logger.debug(
+                "[eval][%s] FILTERED at signal: NO_SIGNAL (MR: score_mr=%.4f not extreme vs q_lo=%.4f, q_hi=%.4f)",
+                timeframe, score_mr_val, q_lo_val, q_hi_val
+            )
+        else:
+            logger.debug(
+                "[eval][%s] FILTERED at signal: NO_SIGNAL (MOM: score_mom=%.4f within +/-%.4f threshold)",
+                timeframe, score_mom_val, mom_threshold
+            )
+        return None
+
+    # Price-confirmation gates (disabled by default; thresholds = 0 means no filter)
+    gates_cfg: Dict[str, Any] = strategy_cfg.get("gates", {})
+    if tf_overrides:
+        gates_cfg = {**gates_cfg, **tf_overrides.get("gates", {})}
+    stretch_z_min = float(gates_cfg.get("stretch_z_min", 0.0))
+    trend_min     = float(gates_cfg.get("trend_min", 0.0))
+    _pz = last.get("price_z")
+    _ts = last.get("trend_strength")
+    price_z_val   = float(_pz) if _pz is not None and not np.isnan(float(_pz)) else float("nan")
+    trend_str_val = float(_ts) if _ts is not None and not np.isnan(float(_ts)) else float("nan")
+    gate_ok, gate_reason = _check_price_gates(
+        regime, signal, price_z_val, trend_str_val, stretch_z_min, trend_min,
+    )
+    if not gate_ok:
+        logger.debug("[gate][%s] signal=%s %s", timeframe, signal.value, gate_reason)
         return None
 
     # Cooldown / dedup check
     bars_elapsed = last_signal_info.get("bars_elapsed", cooldown_bars) if last_signal_info else cooldown_bars
     if not should_emit_signal(signal, regime.value, last_signal_info, cooldown_bars, bars_elapsed):
+        logger.debug(
+            "[eval][%s] FILTERED at cooldown: signal=%s regime=%s bars_elapsed=%d < cooldown=%d (or duplicate)",
+            timeframe, signal.value, regime.value, bars_elapsed, cooldown_bars
+        )
         return None
 
     # Step 4: TP/SL (scaled by sqrt(hold_bars))
@@ -866,23 +1155,70 @@ def evaluate_timeframe(
 
     min_conf = float(conf_cfg.get("min_confidence", 0.55))
     if confidence < min_conf:
+        logger.debug(
+            "[eval][%s] FILTERED at confidence: %.4f < min_conf=%.2f (regime=%.3f tail=%.3f backtest=%.3f sharpe_recent=%.3f)",
+            timeframe, confidence, min_conf, c_regime, c_tail, c_bt, sharpe_recent
+        )
         return None
+
+    # ── Meta-model gate (Step 3) ──────────────────────────────────────
+    # Runs AFTER confidence (uses c_regime/c_tail/c_bt as features) and
+    # AFTER min_confidence check (avoid wasting inference on already-rejected signals).
+    # Falls back silently (no block) when model is absent or feature build fails.
+    meta_cfg: Dict[str, Any] = strategy_cfg.get("meta_model", {})
+    if tf_overrides:
+        meta_cfg = {**meta_cfg, **tf_overrides.get("meta_model", {})}
+    _meta_p_win: Optional[float] = None
+    if meta_cfg.get("enabled", False):
+        _feat_vec = _build_meta_features(
+            rc_val, ar_val, score_mr_val, score_mom_val, vol,
+            c_regime, c_tail, c_bt,
+            price_z_val, trend_str_val,
+            regime, signal,
+            q_hi_val, q_lo_val, hold_bars,
+        )
+        _meta_p_win = _meta_predict(timeframe, _feat_vec, meta_cfg)
+        if _meta_p_win is not None:
+            # Allow per-TF threshold overrides: meta_model.timeframe_thresholds.<tf>
+            _tf_thresholds = meta_cfg.get("timeframe_thresholds", {}).get(timeframe, {})
+            _thr_long  = float(_tf_thresholds.get(
+                "threshold_long",  meta_cfg.get("threshold_long",  0.58)))
+            _thr_short = float(_tf_thresholds.get(
+                "threshold_short", meta_cfg.get("threshold_short", 0.58)))
+            _threshold = _thr_long if signal == Signal.BUY else _thr_short
+            if _meta_p_win < _threshold:
+                logger.debug(
+                    "[meta_gate][%s] blocked: p_win=%.4f < %.2f (signal=%s)",
+                    timeframe, _meta_p_win, _threshold, signal.value,
+                )
+                return None
 
     # Build reason
     parts = [f"Regime={regime.value}(rc={rc_val:.3f},ar={ar_val:.3f})"]
     if regime == Regime.MR:
         parts.append(f"score_mr={score_mr_val:.3f} vs [{q_lo_val:.3f},{q_hi_val:.3f}]")
+        if stretch_z_min > 0.0:
+            parts.append(f"price_z={price_z_val:.3f}(gate|z|>={stretch_z_min:.2f})✓")
     else:
         parts.append(f"score_mom={score_mom_val:.6f} vs +/-{mom_threshold:.6f}")
+        if trend_min > 0.0:
+            parts.append(f"trend_str={trend_str_val:.6f}(gate>={trend_min:.6f})✓")
     parts.append(f"conf={confidence:.2f}")
 
-    # Active params for audit
+    # Active params for audit (includes gate values for dashboard display)
+    _pz_json = round(price_z_val,   4) if not np.isnan(price_z_val)  else None
+    _ts_json = round(trend_str_val, 6) if not np.isnan(trend_str_val) else None
     active_params = {
         "r_min": r_min, "a_min": a_min,
         "quantile_window": q_window,
         "quantile_hi": q_hi_pct, "quantile_lo": q_lo_pct,
         "hold_bars": hold_bars, "mom_k": mom_k,
+        "price_z": _pz_json, "trend_strength": _ts_json,
+        "stretch_z_min": stretch_z_min, "trend_min": trend_min,
     }
+    if _meta_p_win is not None:
+        active_params["meta_p_win"] = round(_meta_p_win, 4)
+        parts.append(f"meta_p_win={_meta_p_win:.3f}✓")
 
     return TradeRecommendation(
         timeframe=timeframe,

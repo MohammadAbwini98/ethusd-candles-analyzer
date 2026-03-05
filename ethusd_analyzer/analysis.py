@@ -174,6 +174,11 @@ def add_strategy_features(
     mom_span: int = 20,
     vol_window: int = 20,
     regime_corr_window: int = 50,
+    # Price-gate feature construction params (match config.yaml strategy.gates)
+    ema_fast_span: int = 20,
+    ema_slow_span: int = 50,
+    stretch_baseline_span: int = 50,
+    stretch_window: int = 200,
 ) -> pd.DataFrame:
     """Add strategy-specific columns to a DataFrame that already has add_features() columns."""
     out = df.copy()
@@ -186,6 +191,23 @@ def add_strategy_features(
     out["rc"] = out["score_mr"].shift(1).rolling(regime_corr_window, min_periods=regime_corr_window).corr(out["log_ret"])
     log_ret_lag1 = out["log_ret"].shift(1)
     out["ar"] = out["log_ret"].rolling(regime_corr_window, min_periods=regime_corr_window).corr(log_ret_lag1)
-    for col in ["score_mom", "volatility", "rc", "ar"]:
+
+    # ── Price-based confirmation gate features ─────────────────────────────────
+    close = out["close"]
+
+    # trend_strength = (EMA_fast − EMA_slow) / close  — scale-free, sign = trend direction
+    out["ema_fast"] = close.ewm(span=ema_fast_span, min_periods=ema_fast_span, adjust=False).mean()
+    out["ema_slow"] = close.ewm(span=ema_slow_span, min_periods=ema_slow_span, adjust=False).mean()
+    trend_raw = out["ema_fast"] - out["ema_slow"]
+    out["trend_strength"] = trend_raw / close.replace(0, np.nan)
+
+    # price_z = (close − EMA_baseline) / rolling_std(close − EMA_baseline)
+    # Measures how far price has stretched from its mean — MR gate input.
+    mr_baseline = close.ewm(span=stretch_baseline_span, adjust=False).mean()
+    dev = close - mr_baseline
+    dev_std = dev.rolling(stretch_window, min_periods=stretch_window).std(ddof=1)
+    out["price_z"] = dev / dev_std.replace(0, np.nan)
+
+    for col in ["score_mom", "volatility", "rc", "ar", "trend_strength", "price_z"]:
         out[col] = out[col].replace([np.inf, -np.inf], np.nan)
     return out

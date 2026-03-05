@@ -565,6 +565,15 @@
       align-items: center;
       justify-content: space-between;
       margin-bottom: 6px;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .chart-toolbar-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
     .price-chart-label {
@@ -579,6 +588,115 @@
       display: flex;
       align-items: center;
       gap: 6px;
+      margin-left: auto;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .chart-tf-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+    }
+
+    .chart-tf-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      border-radius: 4px;
+      padding: 3px 7px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+
+    .chart-tf-btn:hover {
+      color: var(--text);
+      background: rgba(59, 130, 246, .12);
+    }
+
+    .chart-tf-btn.active {
+      color: var(--text);
+      background: rgba(59, 130, 246, .2);
+    }
+
+    .chart-range-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+      margin-left: 8px;
+    }
+
+    .chart-range-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      border-radius: 4px;
+      padding: 3px 6px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+
+    .chart-range-btn:hover {
+      color: var(--text);
+      background: rgba(96, 165, 250, .12);
+    }
+
+    .chart-range-btn.active {
+      color: var(--text);
+      background: rgba(96, 165, 250, .2);
+    }
+
+    .chart-mode-select {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 3px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .chart-mode-select:hover,
+    .chart-mode-select:focus {
+      border-color: var(--accent);
+    }
+
+    .chart-ohlc {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 3px 8px;
+    }
+
+    .chart-ohlc-value {
+      white-space: nowrap;
+    }
+
+    .ohlc-up {
+      color: var(--green);
+    }
+
+    .ohlc-down {
+      color: var(--red);
     }
 
     .chart-btn {
@@ -713,8 +831,35 @@
           <!-- ── Price Chart ── -->
           <div class="price-chart-wrap" id="chartFullscreenWrap">
             <div class="price-chart-toolbar">
-              <span class="price-chart-label">Price Chart</span>
+              <div class="chart-toolbar-left">
+                <span class="price-chart-label">Price Chart</span>
+                <div class="chart-tf-switch">
+                  <button class="chart-tf-btn" data-tf="1m">1m</button>
+                  <button class="chart-tf-btn" data-tf="5m">5m</button>
+                  <button class="chart-tf-btn" data-tf="15m">15m</button>
+                  <button class="chart-tf-btn" data-tf="30m">30m</button>
+                </div>
+                <select id="chartModeSel" class="chart-mode-select" title="Chart type">
+                  <option value="candles" selected>Candles</option>
+                  <option value="line">Line</option>
+                </select>
+                <div class="chart-range-switch" id="chartRangeSwitch">
+                  <button class="chart-range-btn" data-range="1D">1D</button>
+                  <button class="chart-range-btn" data-range="7D">7D</button>
+                  <button class="chart-range-btn" data-range="30D">30D</button>
+                  <button class="chart-range-btn" data-range="3M">3M</button>
+                  <button class="chart-range-btn" data-range="6M">6M</button>
+                  <button class="chart-range-btn active" data-range="1Y">1Y</button>
+                </div>
+                <button class="chart-btn" id="chartFitBtn" title="Reset view">Reset</button>
+              </div>
               <div class="chart-toolbar-right">
+                <div id="chartOhlc" class="chart-ohlc">
+                  <span id="ohlcOpen" class="chart-ohlc-value">O --</span>
+                  <span id="ohlcHigh" class="chart-ohlc-value">H --</span>
+                  <span id="ohlcLow" class="chart-ohlc-value">L --</span>
+                  <span id="ohlcClose" class="chart-ohlc-value">C --</span>
+                </div>
                 <span id="chartTfBadge" class="pill" style="font-size:10px;padding:1px 6px"></span>
                 <button class="chart-btn" id="chartFsBtn" title="Fullscreen"><svg width="13" height="13"
                     viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -911,6 +1056,11 @@
     const lagBody = document.querySelector("#lagTable tbody");
     const rollBody = document.querySelector("#rollTable tbody");
     const histBody = document.querySelector("#historyTable tbody");
+    const chartTfBadge = $("chartTfBadge");
+    const chartTfBtns = Array.from(document.querySelectorAll(".chart-tf-btn"));
+    const chartModeSel = $("chartModeSel");
+    const chartFitBtn = $("chartFitBtn");
+    const ohlcOpen = $("ohlcOpen"), ohlcHigh = $("ohlcHigh"), ohlcLow = $("ohlcLow"), ohlcClose = $("ohlcClose");
 
     /* ── Formatters ───────────────────────────────── */
     function fmt(x) {
@@ -1188,6 +1338,7 @@
     ──────────────────────────────────────────────────────────────────────────── */
     let _lwChart = null;
     let _candleSeries = null;
+    let _lineSeries = null;
     let _volSeries = null;
     let _entryLine = null;
     let _tpLine = null;
@@ -1198,7 +1349,88 @@
     let _chartLoadPending = false;
     let _chartIntervalId = null;
     let _lastChartTf = null;      // to detect TF change
+    let _chartMode = "candles";
+    let _chartRange = "1Y";       // default range: 1 year
+    let _canLoadMore = true;      // flag to enable/disable lazy prepend
+    let _isLoadingMore = false;   // prevent concurrent lazy loads
     const TF_SECS = { "1m": 60, "5m": 300, "15m": 900, "30m": 1800 };
+
+    // Range to bars mapping (approximate)
+    const RANGE_TO_BARS = {
+      "1D": { "1m": 1440, "5m": 288, "15m": 96, "30m": 48 },
+      "7D": { "1m": 2000, "5m": 2000, "15m": 672, "30m": 336 },
+      "30D": { "1m": 2000, "5m": 2000, "15m": 2000, "30m": 1440 },
+      "3M": { "1m": 2000, "5m": 2000, "15m": 2000, "30m": 2000 },
+      "6M": { "1m": 2000, "5m": 2000, "15m": 2000, "30m": 2000 },
+      "1Y": { "1m": 2000, "5m": 2000, "15m": 2000, "30m": 2000 }
+    };
+
+    // LocalStorage cache utilities
+    function _getCacheKey(tf) {
+      return `ethusd_chart_${tf}`;
+    }
+
+    function _saveToCache(tf, bars) {
+      try {
+        const key = _getCacheKey(tf);
+        localStorage.setItem(key, JSON.stringify({ tf, bars, ts: Date.now() }));
+      } catch (e) {
+        console.warn("[cache] save failed:", e);
+      }
+    }
+
+    function _loadFromCache(tf) {
+      try {
+        const key = _getCacheKey(tf);
+        const cached = localStorage.getItem(key);
+        if (!cached) return null;
+        const data = JSON.parse(cached);
+        // Cache valid for 5 minutes
+        if (Date.now() - data.ts > 300000) return null;
+        return data.bars;
+      } catch (e) {
+        console.warn("[cache] load failed:", e);
+        return null;
+      }
+    }
+
+    function _updateTfControls(tf) {
+      chartTfBadge.textContent = tf;
+      chartTfBtns.forEach(btn => btn.classList.toggle("active", btn.dataset.tf === tf));
+    }
+
+    function _updateRangeControls(range) {
+      const rangeBtns = document.querySelectorAll(".chart-range-btn");
+      rangeBtns.forEach(btn => btn.classList.toggle("active", btn.dataset.range === range));
+    }
+
+    function _setOhlcDisplay(bar) {
+      if (!bar) {
+        ohlcOpen.textContent = "O --";
+        ohlcHigh.textContent = "H --";
+        ohlcLow.textContent = "L --";
+        ohlcClose.textContent = "C --";
+        ohlcClose.classList.remove("ohlc-up", "ohlc-down");
+        return;
+      }
+      ohlcOpen.textContent = `O ${fmtShort(bar.open, 2)}`;
+      ohlcHigh.textContent = `H ${fmtShort(bar.high, 2)}`;
+      ohlcLow.textContent = `L ${fmtShort(bar.low, 2)}`;
+      ohlcClose.textContent = `C ${fmtShort(bar.close, 2)}`;
+      const up = Number(bar.close) >= Number(bar.open);
+      ohlcClose.classList.toggle("ohlc-up", up);
+      ohlcClose.classList.toggle("ohlc-down", !up);
+    }
+
+    function _applyChartMode(mode) {
+      _chartMode = mode === "line" ? "line" : "candles";
+      if (!_candleSeries || !_lineSeries || !_volSeries) return;
+      const candlesVisible = _chartMode === "candles";
+      _candleSeries.applyOptions({ visible: candlesVisible });
+      _volSeries.applyOptions({ visible: candlesVisible });
+      _lineSeries.applyOptions({ visible: !candlesVisible });
+      if (chartModeSel.value !== _chartMode) chartModeSel.value = _chartMode;
+    }
 
     function _initChart() {
       if (_lwChart) return;
@@ -1221,7 +1453,79 @@
         priceFormat: { type: "volume" },
         priceScaleId: "vol",
       });
+      _lineSeries = _lwChart.addLineSeries({
+        color: "#60a5fa",
+        lineWidth: 2,
+        visible: false,
+      });
       _lwChart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+      _lwChart.subscribeCrosshairMove(param => {
+        if (!param || param.time === undefined) {
+          _setOhlcDisplay(_chartBars.length ? _chartBars[_chartBars.length - 1] : null);
+          return;
+        }
+        let bar = null;
+        const sd = param.seriesData;
+        if (sd && typeof sd.get === "function") {
+          const hovered = sd.get(_candleSeries);
+          if (hovered && hovered.open != null) {
+            bar = hovered;
+          }
+        }
+        if (!bar && typeof param.time === "number") {
+          bar = _chartBars.find(b => b.time === param.time) || null;
+        }
+        _setOhlcDisplay(bar || (_chartBars.length ? _chartBars[_chartBars.length - 1] : null));
+      });
+
+      // Lazy loading: load more bars when scrolling left
+      _lwChart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+        const logicalRange = _lwChart.timeScale().getVisibleLogicalRange();
+        if (!logicalRange || !_canLoadMore || _isLoadingMore) return;
+
+        // If user scrolled near the left edge, load more history
+        if (logicalRange.from < 50) {
+          _loadMoreHistory();
+        }
+      });
+
+      _applyChartMode(_chartMode);
+    }
+
+    // Load more historical bars when scrolling left
+    async function _loadMoreHistory() {
+      if (_isLoadingMore || !_canLoadMore || !_chartBars.length) return;
+      _isLoadingMore = true;
+
+      try {
+        const oldestTime = _chartBars[0].time;
+        const limit = 500;
+        const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(_chartTf)}&limit=${limit}&before=${oldestTime}`);
+        const newBars = (data.items || []).filter(b => b.open != null && b.time != null && b.time < oldestTime);
+
+        if (newBars.length > 0) {
+          // Prepend new bars
+          _chartBars = [...newBars, ..._chartBars];
+
+          // Update series with all bars
+          _candleSeries.setData(_chartBars);
+          _lineSeries.setData(_chartBars.map(b => ({ time: b.time, value: b.close })));
+          _volSeries.setData(_chartBars.map(b => ({
+            time: b.time, value: b.vol,
+            color: b.close >= b.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
+          })));
+
+          console.log(`[chart] lazy-loaded ${newBars.length} older bars`);
+        } else {
+          _canLoadMore = false; // No more data available
+          console.log("[chart] no more historical data");
+        }
+      } catch (e) {
+        console.warn("[chart] lazy load failed:", e);
+      } finally {
+        _isLoadingMore = false;
+      }
     }
 
     function _removePriceLines() {
@@ -1242,24 +1546,46 @@
     }
 
     // Full bar reload – only runs on TF change or every 30 s
-    async function loadChartBars(tf) {
+    async function loadChartBars(tf, range = _chartRange, useCache = true) {
       if (_chartLoadPending) return;
       _chartLoadPending = true;
       try {
         _initChart();
-        const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(tf)}&limit=300`);
-        const bars = (data.items || []).filter(b => b.open != null && b.time != null);
+
+        // Try cache first
+        let bars = null;
+        if (useCache) {
+          bars = _loadFromCache(tf);
+          if (bars && bars.length) {
+            console.log(`[chart] loaded ${bars.length} bars from cache`);
+          }
+        }
+
+        // Fetch from API if no cache
+        if (!bars || !bars.length) {
+          const limit = RANGE_TO_BARS[range]?.[tf] || 500;
+          const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(tf)}&limit=${limit}`);
+          bars = (data.items || []).filter(b => b.open != null && b.time != null);
+          _saveToCache(tf, bars);
+        }
+
         if (bars.length) {
           _chartBars = bars.map(b => ({ ...b }));
           _chartTf = tf;
+          _chartRange = range;
           _chartLastBarTime = bars[bars.length - 1].time;
+          _canLoadMore = bars.length >= 100; // Enable lazy load if we have enough bars
+
           _candleSeries.setData(bars);
+          _lineSeries.setData(bars.map(b => ({ time: b.time, value: b.close })));
           _volSeries.setData(bars.map(b => ({
             time: b.time, value: b.vol,
             color: b.close >= b.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
           })));
           _lwChart.timeScale().fitContent();
-          document.getElementById("chartTfBadge").textContent = tf;
+          _updateTfControls(tf);
+          _updateRangeControls(range);
+          _setOhlcDisplay(bars[bars.length - 1]);
         }
       } catch (e) { console.warn("[chart] loadChartBars:", e); }
       finally { _chartLoadPending = false; }
@@ -1279,16 +1605,20 @@
         _chartBars.push(nb);
         _chartLastBarTime = curBarTime;
         _candleSeries.update(nb);
+        _lineSeries.update({ time: curBarTime, value: price });
         _volSeries.update({ time: curBarTime, value: 0, color: "rgba(59,130,246,0.25)" });
+        _setOhlcDisplay(nb);
       } else {
         prev.high = Math.max(prev.high, price);
         prev.low = Math.min(prev.low, price);
         prev.close = price;
         _candleSeries.update({ time: _chartLastBarTime, open: prev.open, high: prev.high, low: prev.low, close: price });
+        _lineSeries.update({ time: _chartLastBarTime, value: price });
         _volSeries.update({
           time: _chartLastBarTime, value: prev.vol,
           color: price >= prev.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
         });
+        _setOhlcDisplay(prev);
       }
     }
 
@@ -1296,9 +1626,10 @@
     function scheduleChartRefresh(tf) {
       if (tf !== _lastChartTf) {
         _lastChartTf = tf;
-        loadChartBars(tf);
+        _updateTfControls(tf);
+        loadChartBars(tf, _chartRange);
         if (_chartIntervalId) clearInterval(_chartIntervalId);
-        _chartIntervalId = setInterval(() => loadChartBars(tf), 30000);
+        _chartIntervalId = setInterval(() => loadChartBars(tf, _chartRange), 30000);
       }
     }
 
@@ -1316,6 +1647,7 @@
       _chartWrap.classList.toggle("chart-fullscreen", isFs);
       _chartFsBtn.innerHTML = isFs ? _FS_ICON_CLOSE : _FS_ICON_OPEN;
       _chartFsBtn.title = isFs ? "Exit fullscreen" : "Fullscreen";
+      if (_lwChart) _lwChart.timeScale().fitContent();
     });
 
     /* ── Live Price (1s poll) ─────────────────────── */
@@ -1355,8 +1687,35 @@
     }
 
     /* ── Event Bindings ───────────────────────────── */
+    chartTfBtns.forEach(btn => {
+      btn.addEventListener("click", () => {
+        const nextTf = btn.dataset.tf;
+        if (!nextTf || nextTf === tfEl.value) return;
+        tfEl.value = nextTf;
+        refresh();
+      });
+    });
+
+    // Range selector buttons
+    const chartRangeBtns = document.querySelectorAll(".chart-range-btn");
+    chartRangeBtns.forEach(btn => {
+      btn.addEventListener("click", () => {
+        const range = btn.dataset.range;
+        if (!range || range === _chartRange) return;
+        _chartRange = range;
+        loadChartBars(_chartTf || tfEl.value, range, false); // Force fresh load for new range
+      });
+    });
+
+    chartModeSel.addEventListener("change", () => _applyChartMode(chartModeSel.value));
+    chartFitBtn.addEventListener("click", () => {
+      if (_lwChart) _lwChart.timeScale().fitContent();
+    });
+
     tfEl.addEventListener("change", refresh);
     refreshBtn.addEventListener("click", refresh);
+    _updateTfControls(tfEl.value);
+    _updateRangeControls(_chartRange);
     setInterval(refresh, 2000);
     refresh();
   </script>

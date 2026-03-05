@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+import signal
+import socket
+import subprocess
+import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -10,6 +15,22 @@ import webbrowser
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+class _ReuseAddrHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that always sets SO_REUSEADDR + SO_REUSEPORT."""
+    allow_reuse_address = True
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass  # SO_REUSEPORT not available on all platforms
+        super().server_bind()
 
 def _sanitize(obj: object) -> object:
     """Replace float NaN/Inf with None so json.dumps produces valid JSON."""
@@ -37,9 +58,43 @@ class DashboardServer:
     def update_live_price(self, price: float, bid: float, ask: float, ts: str) -> None:
         self.live_price = {"price": price, "bid": bid, "ask": ask, "ts": ts}
 
+    @staticmethod
+    def _free_port(port: int) -> None:
+        """Kill any PID listening on *port* (excluding our own process)."""
+        my_pid = os.getpid()
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True, text=True
+            )
+            pids = [p for p in result.stdout.strip().split() if p]
+            for pid_str in pids:
+                try:
+                    pid = int(pid_str)
+                    if pid != my_pid:
+                        os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+        except Exception:
+            pass
+
     def start(self):
         handler = self._make_handler()
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        last_err = None
+        for attempt in range(5):
+            if attempt > 0:
+                self._free_port(self.port)
+                time.sleep(0.6 * attempt)  # 0.6s, 1.2s, 1.8s, 2.4s
+            try:
+                self._httpd = _ReuseAddrHTTPServer((self.host, self.port), handler)
+                break
+            except OSError as exc:
+                last_err = exc
+        else:
+            raise OSError(
+                f"[dashboard] Could not bind to port {self.port} after 5 attempts: {last_err}"
+            ) from last_err
+
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
 
@@ -113,7 +168,9 @@ class DashboardServer:
 
                 if path == "/api/candles":
                     limit = int(qs.get("limit", ["200"])[0])
-                    payload = _sanitize(_latest_candles(engine, schema, tf, limit))
+                    before = qs.get("before", [None])[0]
+                    before_ts = int(before) if before else None
+                    payload = _sanitize(_latest_candles(engine, schema, tf, limit, before_ts))
                     return self._send(200, json.dumps(payload, default=str).encode("utf-8"), "application/json")
 
                 if path == "/api/price":
@@ -269,19 +326,43 @@ def _latest_equity(engine: Engine, schema: str, tf: str) -> dict:
         return {"timeframe": tf, "items": []}
 
 
-def _latest_candles(engine: Engine, schema: str, tf: str, limit: int = 200) -> dict:
-    """Return recent OHLCV bars for the candlestick chart."""
+def _latest_candles(engine: Engine, schema: str, tf: str, limit: int = 200, before_ts: int | None = None) -> dict:
+    """Return recent OHLCV bars for the candlestick chart.
+    
+    Args:
+        engine: SQLAlchemy engine
+        schema: Database schema name
+        tf: Timeframe (e.g., "1m", "5m")
+        limit: Maximum number of bars to return
+        before_ts: Optional timestamp - if provided, only return bars before this time (for lazy loading)
+    """
     try:
-        sql = text(f"""
-            SELECT ts, open, high, low, close, vol
-            FROM {schema}.candles
-            WHERE timeframe = :tf
-              AND open IS NOT NULL
-            ORDER BY ts DESC
-            LIMIT :lim
-        """)
-        with engine.connect() as conn:
-            rows = conn.execute(sql, {"tf": tf, "lim": limit}).mappings().all()
+        if before_ts:
+            # For lazy loading: fetch bars older than before_ts
+            sql = text(f"""
+                SELECT ts, open, high, low, close, vol
+                FROM {schema}.candles
+                WHERE timeframe = :tf
+                  AND open IS NOT NULL
+                  AND EXTRACT(EPOCH FROM ts) < :before
+                ORDER BY ts DESC
+                LIMIT :lim
+            """)
+            with engine.connect() as conn:
+                rows = conn.execute(sql, {"tf": tf, "lim": limit, "before": before_ts}).mappings().all()
+        else:
+            # Normal fetch: most recent bars
+            sql = text(f"""
+                SELECT ts, open, high, low, close, vol
+                FROM {schema}.candles
+                WHERE timeframe = :tf
+                  AND open IS NOT NULL
+                ORDER BY ts DESC
+                LIMIT :lim
+            """)
+            with engine.connect() as conn:
+                rows = conn.execute(sql, {"tf": tf, "lim": limit}).mappings().all()
+        
         items = []
         for r in reversed(list(rows)):
             ts = r["ts"]

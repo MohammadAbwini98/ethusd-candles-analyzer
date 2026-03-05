@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -13,12 +15,17 @@ import pandas as pd
 
 from typing import Any, Dict, Optional, Set
 
-from .utils import load_config, save_json, now_ts, send_alert
+from .utils import load_config, save_json, now_ts, send_alert, set_telegram_notifier, set_email_notifier, set_macos_notifier
 from .db import DbConfig, make_engine, fetch_candles
 from .analysis import add_features, add_strategy_features, resample_timeframe, correlation_table, lag_correlation, rolling_correlations
-from .storage import OutputConfig, init_schema_and_tables, save_snapshot, save_signal_recommendation, save_calibration_result
-from .strategy import evaluate_timeframe, run_calibration
+from .storage import OutputConfig, init_schema_and_tables, save_snapshot, save_signal_recommendation, save_calibration_result, save_meta_model_run
+from .strategy import evaluate_timeframe, run_calibration, invalidate_meta_model_cache
+from .meta_labeler import label_signals
+from .meta_trainer import maybe_retrain
 from .dashboard_server import DashboardServer
+from .telegram_notifier import get_telegram_notifier, TelegramNotifier
+from .email_notifier import get_email_notifier, EmailNotifier
+from .macos_notifier import get_macos_notifier, MacOSNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +33,16 @@ logger = logging.getLogger(__name__)
 _cfg_raw: Dict[str, Any] = {}
 # Timestamp of the last daily summary alert (epoch seconds).
 _last_daily_summary: float = 0.0
-
-
+# Telegram notifier singleton (set by main after creation).
+_telegram_notifier: Optional[TelegramNotifier] = None
+# Email notifier singleton (set by main after creation).
+_email_notifier: Optional[EmailNotifier] = None
+# macOS notifier singleton (set by main after creation).
+_macos_notifier: Optional[MacOSNotifier] = None
+# Shutdown message sent flag (ensure sent only once)
+_shutdown_msg_sent: bool = False
+# Dedupe key cache for Telegram signal notifications per timeframe.
+_last_sent_signal_key: Dict[str, str] = {}
 # ── WhatsApp notifier auto-start ────────────────────────────────
 
 def _start_notifier(alerts_cfg: Dict[str, Any]) -> Optional[subprocess.Popen]:
@@ -79,29 +94,33 @@ def _start_notifier(alerts_cfg: Dict[str, Any]) -> Optional[subprocess.Popen]:
     t = threading.Thread(target=_pipe, daemon=True)
     t.start()
 
-    # Poll /health until the WhatsApp client is ready (session restore can take ~40s)
+    # Poll /health in a background daemon thread — never blocks the main analyzer loop.
     import urllib.request
     import urllib.error
 
     port = env["PORT"]
     health_url = f"http://127.0.0.1:{port}/health"
-    deadline = time.time() + 90  # wait up to 90 seconds
-    print(f"[notifier] Sidecar started (pid={proc.pid}) \u2192 WA {wa_number} — waiting for WhatsApp client...")
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            print("[notifier] Sidecar exited unexpectedly during startup.")
-            return proc
-        try:
-            with urllib.request.urlopen(health_url, timeout=2) as r:
-                import json as _json
-                data = _json.loads(r.read())
-                if data.get("ready"):
-                    print("[notifier] WhatsApp client ready \u2713")
-                    return proc
-        except Exception:
-            pass
-        time.sleep(2)
-    print("[notifier] WARNING: WhatsApp client did not become ready within 90s — alerts will be queued until it connects")
+    print(f"[notifier] Sidecar started (pid={proc.pid}) \u2192 WA {wa_number} — WhatsApp client connecting in background...")
+
+    def _wait_ready():
+        deadline = time.time() + 120  # up to 2 minutes in background
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                print("[notifier] Sidecar exited unexpectedly.")
+                return
+            try:
+                with urllib.request.urlopen(health_url, timeout=2) as r:
+                    import json as _json
+                    data = _json.loads(r.read())
+                    if data.get("ready"):
+                        print("[notifier] WhatsApp client ready \u2713")
+                        return
+            except Exception:
+                pass
+            time.sleep(3)
+        print("[notifier] WARNING: WhatsApp client did not become ready within 120s — alerts will be delayed until it connects")
+
+    threading.Thread(target=_wait_ready, daemon=True, name="wa-health-poll").start()
     return proc
 
 # ── CLI ─────────────────────────────────────────────────────────
@@ -247,8 +266,10 @@ def _run_strategy_cycle(
     # FR-09: K-of-M regime persistence config
     persistence_k = int(regime_cfg.get("persistence_k", 1))
     persistence_m = int(regime_cfg.get("persistence_m", 1))
-    # FR-22: walk-forward folds
+    # FR-22: walk-forward folds + OOS constraints
     walk_forward_folds = int(cal_cfg.get("walk_forward_folds", 1))
+    min_trades_oos = int(cal_cfg.get("min_trades_oos", 0))
+    min_folds_with_trades = int(cal_cfg.get("min_folds_with_trades", 1))
     # FR-26: symbol
     epic_symbol: str = strategy_cfg.get("symbol", "ETHUSD")
 
@@ -256,11 +277,16 @@ def _run_strategy_cycle(
         if tf not in strategy_tfs:
             continue
 
+        gates_cfg = strategy_cfg.get("gates", {})
         df_strat = add_strategy_features(
             df_feat,
             mom_span=int(regime_cfg.get("mom_span", 20)),
             vol_window=int(regime_cfg.get("vol_window", 20)),
             regime_corr_window=int(regime_cfg.get("regime_corr_window", 50)),
+            ema_fast_span=int(gates_cfg.get("ema_fast_span", 20)),
+            ema_slow_span=int(gates_cfg.get("ema_slow_span", 50)),
+            stretch_baseline_span=int(gates_cfg.get("stretch_baseline_span", 50)),
+            stretch_window=int(gates_cfg.get("stretch_window", 200)),
         )
 
         # FR-35: structured cycle log per timeframe
@@ -288,17 +314,25 @@ def _run_strategy_cycle(
                     min_trades=min_trades,
                     walk_forward_folds=walk_forward_folds,   # FR-22
                     per_tf_overrides=per_tf_cal,             # FR-18
+                    stretch_z_min=float(gates_cfg.get("stretch_z_min", 0.0)),
+                    trend_min=float(gates_cfg.get("trend_min", 0.0)),
+                    min_trades_oos=min_trades_oos,
+                    min_folds_with_trades=min_folds_with_trades,
                 )
                 # FR-35: structured calibration result log
                 logger.info(
                     "[calibration_result] tf=%s status=%s sharpe=%.3f trades=%d "
                     "eligible=%d/%d rej_mt=%d rej_dd=%d rej_both=%d "
-                    "max_trades_seen=%d best_dd_seen=%.4f",
+                    "max_trades_seen=%d best_dd_seen=%.4f "
+                    "folds_used=%d oos_trades=%d oos_wr=%.2f worst_fold_dd=%.4f rej_oos_folds=%d",
                     tf, cal_result.status, cal_result.net_sharpe, cal_result.n_trades,
                     cal_result.eligible_candidates, cal_result.total_candidates,
                     cal_result.rejected_by_min_trades, cal_result.rejected_by_max_dd,
                     cal_result.rejected_by_both, cal_result.max_trades_seen,
                     cal_result.best_dd_seen,
+                    cal_result.folds_used, cal_result.oos_trades,
+                    cal_result.oos_win_rate, cal_result.worst_fold_dd,
+                    cal_result.rejected_oos_folds,
                 )
                 # FR-4: Only update params if calibration succeeded
                 if cal_result.status == "OK":
@@ -344,11 +378,19 @@ def _run_strategy_cycle(
             regime_hist = calibration_state.setdefault("regime_hist", {})
             tf_regime_history: list = regime_hist.setdefault(tf, [])
 
+            # Diagnostic: log evaluation attempt
+            cal_params = calibration_state.get("params", {}).get(tf)
+            logger.debug(
+                "[signal_eval][%s] Evaluating: rows=%d cal_params=%s last_sig=%s",
+                tf, len(df_strat), "present" if cal_params else "MISSING",
+                last_sig.get("signal") if last_sig else "none"
+            )
+            
             rec = evaluate_timeframe(
                 df_strat,
                 timeframe=tf,
                 strategy_cfg=strategy_cfg,
-                calibration_params=calibration_state.get("params", {}).get(tf),
+                calibration_params=cal_params,
                 sharpe_recent=calibration_state.get("sharpe", {}).get(tf, 0.0),
                 last_signal_info=last_sig,
                 cooldown_bars=cooldown_bars,
@@ -374,6 +416,122 @@ def _run_strategy_cycle(
                     f"TP={rec.take_profit:.2f} SL={rec.stop_loss:.2f}",
                     _cfg_raw, "signal_fired",
                 )
+                
+                # ── Telegram: send detailed signal message ─────────────────────────
+                if _telegram_notifier is not None:
+                    try:
+                        signal_time_val = datetime.now(timezone.utc).isoformat()
+                        if "market_time" in df_strat.columns and not df_strat.empty:
+                            signal_time_val = str(df_strat.iloc[-1]["market_time"])
+                        dedupe_key = f"{tf}|{signal_time_val}|{rec.signal}"
+                        if _last_sent_signal_key.get(tf) == dedupe_key:
+                            logger.debug("[telegram_signal] Skipped duplicate signal key=%s", dedupe_key)
+                        else:
+                            _last_sent_signal_key[tf] = dedupe_key
+
+                            # Compute hold duration in minutes from hold_bars
+                            tf_minutes = {
+                                "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                                "1h": 60, "4h": 240, "1d": 1440,
+                            }.get(tf, 15)  # Default to 15m if unknown
+                            hold_minutes = rec.hold_bars * tf_minutes
+
+                            tg_msg = TelegramNotifier.format_signal_message(
+                                symbol=rec.symbol,
+                                timeframe=tf,
+                                signal=rec.signal,
+                                regime=rec.regime,
+                                confidence=rec.confidence,
+                                entry_price=rec.entry_price,
+                                take_profit=rec.take_profit,
+                                stop_loss=rec.stop_loss,
+                                hold_bars=rec.hold_bars,
+                                hold_minutes=hold_minutes,
+                                rc=rec.rc,
+                                ar=rec.ar,
+                                volatility=rec.volatility,
+                                price_z=(rec.params_json or {}).get("price_z"),
+                                trend_strength=(rec.params_json or {}).get("trend_strength"),
+                                timestamp=datetime.now(timezone.utc),
+                            )
+                            import threading
+                            threading.Thread(
+                                target=_telegram_notifier.send_message,
+                                args=(tg_msg,),
+                                daemon=True,
+                            ).start()
+                            logger.debug("[telegram_signal] Enqueued detailed signal message")
+                    except Exception as e:
+                        logger.warning("[telegram_signal] Failed to send detailed message: %s", e)
+                
+                # ── Email: send detailed signal message ───────────────────────────
+                if _email_notifier is not None:
+                    try:
+                        signal_time_val = datetime.now(timezone.utc).isoformat()
+                        if "market_time" in df_strat.columns and not df_strat.empty:
+                            signal_time_val = str(df_strat.iloc[-1]["market_time"])
+                        
+                        # Compute hold duration in minutes from hold_bars
+                        tf_minutes = {
+                            "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                            "1h": 60, "4h": 240, "1d": 1440,
+                        }.get(tf, 15)  # Default to 15m if unknown
+                        hold_minutes = rec.hold_bars * tf_minutes
+
+                        subject, html_body = EmailNotifier.format_signal_message(
+                            symbol=rec.symbol,
+                            timeframe=tf,
+                            signal=rec.signal,
+                            regime=rec.regime,
+                            confidence=rec.confidence,
+                            entry_price=rec.entry_price,
+                            take_profit=rec.take_profit,
+                            stop_loss=rec.stop_loss,
+                            hold_bars=rec.hold_bars,
+                            hold_minutes=hold_minutes,
+                            rc=rec.rc,
+                            ar=rec.ar,
+                            volatility=rec.volatility,
+                            price_z=(rec.params_json or {}).get("price_z"),
+                            trend_strength=(rec.params_json or {}).get("trend_strength"),
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                        import threading
+                        threading.Thread(
+                            target=_email_notifier.send_message,
+                            args=(subject, html_body),
+                            daemon=True,
+                        ).start()
+                        logger.debug("[email_signal] Enqueued detailed signal message")
+                    except Exception as e:
+                        logger.warning("[email_signal] Failed to send detailed message: %s", e)
+                
+                # ── macOS: send signal notification ───────────────────────────────
+                if _macos_notifier is not None:
+                    try:
+                        # Compute hold duration in minutes from hold_bars
+                        tf_minutes = {
+                            "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                            "1h": 60, "4h": 240, "1d": 1440,
+                        }.get(tf, 15)  # Default to 15m if unknown
+                        hold_minutes = rec.hold_bars * tf_minutes
+
+                        title, message, subtitle = MacOSNotifier.format_signal_message(
+                            symbol=rec.symbol,
+                            timeframe=tf,
+                            signal=rec.signal,
+                            confidence=rec.confidence,
+                            entry_price=rec.entry_price,
+                            take_profit=rec.take_profit,
+                            stop_loss=rec.stop_loss,
+                            hold_bars=rec.hold_bars,
+                        )
+                        # Use deduplication to avoid spamming same signal
+                        _macos_notifier.notify_with_dedupe(tf, title, message, subtitle)
+                        logger.debug("[macos_signal] Enqueued signal notification")
+                    except Exception as e:
+                        logger.warning("[macos_signal] Failed to send notification: %s", e)
+                
                 if out_cfg.enabled:
                     save_signal_recommendation(engine, out_cfg.schema, rec, out_cfg)
                 # Update cooldown tracking
@@ -382,8 +540,43 @@ def _run_strategy_cycle(
                     "regime": rec.regime,
                     "bars_elapsed": 0,
                 }
+            else:
+                # Diagnostic: log why no signal
+                logger.debug(
+                    "[signal_eval][%s] No signal generated (check strategy.py debug logs for filters)",
+                    tf
+                )
         except Exception as e:
-            logger.warning(f"[signal][{tf}] evaluation failed: {e}")
+            logger.warning(f"[signal][{tf}] evaluation failed: {e}", exc_info=True)
+
+        # ── Meta-model: label past signals + conditionally retrain ─────────────
+        meta_cfg: Dict[str, Any] = strategy_cfg.get("meta_model", {})
+        if meta_cfg.get("enabled", False) or True:   # labeling always on (free)
+            try:
+                n_labeled = label_signals(engine, out_cfg.schema, tf)
+                if n_labeled > 0:
+                    logger.info("[meta_labeler][%s] labeled %d new outcomes", tf, n_labeled)
+            except Exception as exc:
+                logger.warning("[meta_labeler][%s] labeling failed: %s", tf, exc)
+
+        if meta_cfg.get("enabled", False):
+            try:
+                tf_meta_state = calibration_state["meta"].setdefault(tf, {})
+                meta_run = maybe_retrain(
+                    engine, out_cfg.schema, tf, meta_cfg, tf_meta_state,
+                )
+                if meta_run is not None:
+                    # Bust the in-process cache so next prediction loads new model
+                    invalidate_meta_model_cache(tf)
+                    logger.info(
+                        "[meta_trainer][%s] Retrained — AUC=%.4f Brier=%.4f samples=%d",
+                        tf, meta_run.get("auc", 0.0), meta_run.get("brier_score", 1.0),
+                        meta_run.get("n_samples", 0),
+                    )
+                    if out_cfg.enabled:
+                        save_meta_model_run(engine, out_cfg.schema, meta_run, out_cfg)
+            except Exception as exc:
+                logger.warning("[meta_trainer][%s] retrain cycle failed: %s", tf, exc)
 
     if should_calibrate:
         calibration_state["last_calibration_time"] = now
@@ -615,9 +808,8 @@ def _run_capital_mode(cfg, engine, out_cfg, dash, out_dir,
             time.sleep(tick_poll)
 
     except KeyboardInterrupt:
-        print("\nStopped by user (Ctrl+C).")
-        if dash:
-            dash.stop()
+        # Re-raise so main() finally block handles all teardown uniformly.
+        raise
 
 # ── Legacy DB-table mode ────────────────────────────────────────
 
@@ -690,25 +882,223 @@ def _run_db_table_mode(cfg, engine, out_cfg, dash, out_dir,
 
             time.sleep(poll_seconds)
     except KeyboardInterrupt:
-        print("\nStopped by user (Ctrl+C).")
-        if dash:
-            dash.stop()
+        # Re-raise so main() finally block handles all teardown uniformly.
+        raise
+
+# ── Startup/Shutdown Handlers ──────────────────────────────────
+
+def _send_startup_alert(symbol: str = "ETH", mode: str = "LIVE") -> None:
+    """Send startup notification to WhatsApp, Telegram, Email, and macOS."""
+    events_cfg = _cfg_raw.get("alerts", {}).get("events", {})
+    if not events_cfg.get("startup", True):
+        return
+    
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # WhatsApp (simple text via send_alert)
+    whatsapp_msg = f"🟢 {symbol} Analyzer Started\n\nMode: {mode}\nTime: {timestamp}"
+    send_alert(whatsapp_msg, _cfg_raw, "startup")
+    
+    # Telegram
+    if _telegram_notifier is not None:
+        msg = TelegramNotifier.format_startup_message(symbol=symbol, mode=mode)
+        try:
+            _telegram_notifier.send_message(msg)
+            logger.info("[startup_alert] Telegram notification sent")
+        except Exception as e:
+            logger.warning("[startup_alert] Failed to send Telegram: %s", e)
+    
+    # Email
+    if _email_notifier is not None:
+        subject, html_body = EmailNotifier.format_startup_message(symbol=symbol, mode=mode)
+        try:
+            import threading
+            threading.Thread(
+                target=_email_notifier.send_message,
+                args=(subject, html_body),
+                daemon=True,
+            ).start()
+            logger.info("[startup_alert] Email notification sent")
+        except Exception as e:
+            logger.warning("[startup_alert] Failed to send Email: %s", e)
+    
+    # macOS
+    if _macos_notifier is not None:
+        title, message, subtitle = MacOSNotifier.format_startup_message(symbol=symbol, mode=mode)
+        try:
+            _macos_notifier.notify(title, message, subtitle)
+            logger.info("[startup_alert] macOS notification sent")
+        except Exception as e:
+            logger.warning("[startup_alert] Failed to send macOS: %s", e)
+
+
+def _send_shutdown_alert(
+    symbol: str = "ETH",
+    reason: str = "normal",
+    error_msg: Optional[str] = None,
+) -> None:
+    """Send shutdown notification (once only) to WhatsApp, Telegram, Email, and macOS."""
+    global _shutdown_msg_sent
+
+    events_cfg = _cfg_raw.get("alerts", {}).get("events", {})
+    if not events_cfg.get("shutdown", True):
+        return
+    
+    if _shutdown_msg_sent:
+        return
+    
+    _shutdown_msg_sent = True
+    
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # WhatsApp (simple text via send_alert)
+    reason_emoji = {"normal": "✅", "error": "🚨", "signal": "🔔"}.get(reason, "⚪")
+    whatsapp_msg = f"{reason_emoji} {symbol} Analyzer Stopped\n\nReason: {reason}\nTime: {timestamp}"
+    if error_msg:
+        whatsapp_msg += f"\nError: {error_msg}"
+    send_alert(whatsapp_msg, _cfg_raw, "shutdown")
+    
+    # Telegram
+    if _telegram_notifier is not None:
+        msg = TelegramNotifier.format_shutdown_message(
+            symbol=symbol, reason=reason, error_msg=error_msg
+        )
+        try:
+            _telegram_notifier.send_message(msg)
+            logger.info("[shutdown_alert] Telegram notification sent (reason=%s)", reason)
+        except Exception as e:
+            logger.warning("[shutdown_alert] Failed to send Telegram: %s", e)
+    
+    # Email
+    if _email_notifier is not None:
+        subject, html_body = EmailNotifier.format_shutdown_message(
+            symbol=symbol, reason=reason, error_msg=error_msg
+        )
+        try:
+            import threading
+            threading.Thread(
+                target=_email_notifier.send_message,
+                args=(subject, html_body),
+                daemon=True,
+            ).start()
+            logger.info("[shutdown_alert] Email notification sent (reason=%s)", reason)
+        except Exception as e:
+            logger.warning("[shutdown_alert] Failed to send Email: %s", e)
+    
+    # macOS (use sync to ensure it completes before exit)
+    if _macos_notifier is not None:
+        title, message, subtitle = MacOSNotifier.format_shutdown_message(
+            symbol=symbol, reason=reason, error_msg=error_msg
+        )
+        try:
+            _macos_notifier.notify_sync(title, message, subtitle)
+            logger.info("[shutdown_alert] macOS notification sent (reason=%s)", reason)
+        except Exception as e:
+            logger.warning("[shutdown_alert] Failed to send macOS: %s", e)
+
+
+def _register_signal_handlers(symbol: str = "ETH") -> None:
+    """Register SIGINT, SIGTERM (and SIGHUP on Unix) for graceful shutdown.
+
+    Strategy:
+    - SIGINT  → raise KeyboardInterrupt  (caught by main try/except)
+    - SIGTERM → raise SystemExit(128+15)  (caught by main try/except)
+    - SIGHUP  → same as SIGTERM (daemon restart / terminal close)
+    - atexit  → last-resort flush in case Python skips the except handlers
+    """
+    def _on_sigint(signum, frame):
+        logger.warning("[signal] SIGINT received — initiating graceful shutdown")
+        _send_shutdown_alert(symbol=symbol, reason="SIGINT")
+        raise KeyboardInterrupt()
+
+    def _on_sigterm(signum, frame):
+        logger.warning("[signal] SIGTERM received — initiating graceful shutdown")
+        _send_shutdown_alert(symbol=symbol, reason="SIGTERM")
+        raise SystemExit(128 + 15)  # conventional SIGTERM exit code
+
+    def _on_exit():
+        # atexit fires even when sys.exit() is called; _send_shutdown_alert
+        # is idempotent (flag-guarded) so duplicate calls are safe.
+        _send_shutdown_alert(symbol=symbol, reason="normal")
+
+    import atexit
+    signal.signal(signal.SIGINT, _on_sigint)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    # SIGHUP only exists on Unix; skip on Windows
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _on_sigterm)
+    atexit.register(_on_exit)
+
+
+# ── Logging setup ──────────────────────────────────────────────────
+
+def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> None:
+    """Configure both console and file logging with daily rotation."""
+    from pathlib import Path as _LogPath
+    import logging.handlers
+    
+    _LogPath(log_dir).mkdir(exist_ok=True)
+    log_file = _LogPath(log_dir) / f"analyzer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    # Root logger
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.handlers.clear()  # Clear any existing handlers
+    
+    # Console handler (colorful, concise)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    root.addHandler(console)
+    
+    # File handler (detailed, with module names)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=50 * 1024 * 1024,  # 50MB per file
+        backupCount=14,              # Keep 2 weeks
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)-8s] [%(name)s:%(lineno)d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    root.addHandler(file_handler)
+    
+    logger.info("Logging initialized: console=%s file=%s", logging.getLevelName(console.level), log_file)
+
 
 # ── main ────────────────────────────────────────────────────────
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    setup_logging(log_dir="logs", level=logging.DEBUG)
 
     args = parse_args()
     cfg = load_config(args.config)
 
     # Expose config to module-level alert helpers
-    global _cfg_raw
+    global _cfg_raw, _telegram_notifier, _email_notifier, _macos_notifier
     _cfg_raw = cfg.raw
+
+    # Initialize Telegram notifier (if configured)
+    _telegram_notifier = get_telegram_notifier(cfg.raw)
+    set_telegram_notifier(_telegram_notifier)  # Register in utils.py
+    
+    # Initialize Email notifier (if configured)
+    _email_notifier = get_email_notifier(cfg.raw)
+    set_email_notifier(_email_notifier)  # Register in utils.py
+    
+    # Initialize macOS notifier (if configured)
+    _macos_notifier = get_macos_notifier(cfg.raw)
+    set_macos_notifier(_macos_notifier)  # Register in utils.py
+    
+    # Get symbol for alerts
+    epic_symbol = cfg.raw.get("strategy", {}).get("symbol", "ETH")
 
     db_cfg = DbConfig(
         host=cfg.db.get("host","localhost"),
@@ -761,15 +1151,23 @@ def main():
         "sharpe": {},
         "last_signal": {},
         "regime_hist": {},   # FR-09: per-TF regime classification history for K-of-M persistence
+        "meta": {},          # meta-model trainer state per-TF (last_trained_count, last_trained_ts)
     }
     if strategy_cfg.get("enabled"):
         print(f"[strategy] Enabled for timeframes: {sorted(strategy_tfs)}")
+
+    # Register signal handlers for graceful shutdown
+    _register_signal_handlers(symbol=epic_symbol)
 
     # Auto-start WhatsApp notifier sidecar
     alerts_cfg = cfg.raw.get("alerts", {})
     notifier_proc: Optional[subprocess.Popen] = _start_notifier(alerts_cfg)
 
+    # Send startup notification via Telegram
     data_source = cfg.raw.get("data_source", "db_table")
+    mode_label = "Capital.com API" if data_source == "capital_api" else "DB table"
+    _send_startup_alert(symbol=epic_symbol, mode=mode_label)
+
     common = dict(
         cfg=cfg, engine=engine, out_cfg=out_cfg, dash=dash, out_dir=out_dir,
         z_window=z_window, resamples=resamples, horizons=horizons,
@@ -791,18 +1189,60 @@ def main():
         else:
             print("[mode] DB table — polling external candles table")
             _run_db_table_mode(**common)
+    except KeyboardInterrupt:
+        logger.warning("[main] Interrupted by user (KeyboardInterrupt)")
+        _send_shutdown_alert(symbol=epic_symbol, reason="SIGINT")
+    except SystemExit:
+        logger.warning("[main] SystemExit triggered")
+        _send_shutdown_alert(symbol=epic_symbol, reason="SIGTERM")
+        raise
     except Exception as _fatal:
-        send_alert(f"\U0001f4a5 [Analyzer] Fatal crash: {_fatal}", _cfg_raw, "system_error")
+        logger.critical("[main] Fatal exception: %s", _fatal, exc_info=True)
+        _send_shutdown_alert(
+            symbol=epic_symbol,
+            reason="exception",
+            error_msg=str(_fatal)[:200],
+        )
+        send_alert(
+            f"\U0001f4a5 [Analyzer] Fatal crash: {_fatal}",
+            _cfg_raw, "system_error"
+        )
         raise
     finally:
-        send_alert("\U0001f534 [Analyzer] Stopped.", _cfg_raw, "system_error")
+        logger.info("[main] Cleanup: shutting down services...")
+        send_alert(f"\U0001f534 [Analyzer] Stopped.", _cfg_raw, "system_error")
+
+        # ── 1. Stop WhatsApp notifier sidecar ────────────────────────────
         if notifier_proc is not None and notifier_proc.poll() is None:
             notifier_proc.terminate()
             try:
                 notifier_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                logger.warning("[main] Notifier did not exit in 5 s — SIGKILL")
                 notifier_proc.kill()
+                notifier_proc.wait()
             print("[notifier] Sidecar stopped.")
+
+        # ── 2. Stop dashboard HTTP server ────────────────────────────────
+        if dash is not None:
+            try:
+                dash.stop()
+                logger.info("[main] Dashboard stopped.")
+            except Exception as e:
+                logger.warning("[main] Failed to stop dashboard: %s", e)
+
+        # ── 3. Dispose SQLAlchemy engine (closes all pooled connections) ─
+        try:
+            engine.dispose()
+            logger.info("[main] Database engine disposed — all connections closed.")
+        except Exception as e:
+            logger.warning("[main] engine.dispose() failed: %s", e)
+
+        # ── 4. Final GC + log flush ───────────────────────────────────────
+        gc.collect()
+        logger.info("[main] Shutdown complete.")
+        # Flush all log handlers and close them cleanly.
+        logging.shutdown()
 
 if __name__ == "__main__":
     main()

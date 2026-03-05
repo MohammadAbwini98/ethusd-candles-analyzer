@@ -182,6 +182,21 @@ def init_schema_and_tables(engine: Engine, schema: str) -> None:
               equity DOUBLE PRECISION,
               PRIMARY KEY (run_id, bar_index)
             )""",
+        # Meta-model training run registry
+        f"""CREATE TABLE IF NOT EXISTS {schema}.meta_model_runs (
+              id BIGSERIAL PRIMARY KEY,
+              timeframe TEXT NOT NULL,
+              trained_at TIMESTAMPTZ NOT NULL,
+              n_samples INTEGER,
+              n_win INTEGER,
+              n_loss INTEGER,
+              auc DOUBLE PRECISION,
+              brier_score DOUBLE PRECISION,
+              features TEXT,
+              threshold DOUBLE PRECISION,
+              model_path TEXT
+            )""",
+        f"CREATE INDEX IF NOT EXISTS meta_model_runs_tf_idx ON {schema}.meta_model_runs(timeframe, trained_at DESC)",
     ]
     # Migrations: add columns that may be missing on existing tables
     migrations = [
@@ -222,9 +237,41 @@ def init_schema_and_tables(engine: Engine, schema: str) -> None:
         f"""DO $$ BEGIN
             ALTER TABLE {schema}.calibration_runs ADD COLUMN best_dd_seen DOUBLE PRECISION;
         EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        # Walk-forward OOS aggregate fields
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.calibration_runs ADD COLUMN folds_used INTEGER;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.calibration_runs ADD COLUMN oos_trades INTEGER;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.calibration_runs ADD COLUMN oos_win_rate DOUBLE PRECISION;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.calibration_runs ADD COLUMN worst_fold_dd DOUBLE PRECISION;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.calibration_runs ADD COLUMN rejected_oos_folds INTEGER;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
         # Ingestion: timestamp of sentiment record attached to each candle
         f"""DO $$ BEGIN
             ALTER TABLE {schema}.candles ADD COLUMN sentiment_ts TIMESTAMPTZ;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        # Meta-model outcome labeling columns on signal_recommendations
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN outcome TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN pnl DOUBLE PRECISION;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN exit_price DOUBLE PRECISION;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN exit_ts TIMESTAMPTZ;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN label_computed_at TIMESTAMPTZ;
         EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
     ]
 
@@ -438,13 +485,15 @@ def save_calibration_result(
                          max_drawdown, n_trades, win_rate, param_grid_size, lookback_days,
                          min_trades, eligible_candidates, total_candidates, status, rejection_reason,
                          max_dd_used, rejected_by_min_trades, rejected_by_max_dd,
-                         rejected_by_both, max_trades_seen, best_dd_seen)
+                         rejected_by_both, max_trades_seen, best_dd_seen,
+                         folds_used, oos_trades, oos_win_rate, worst_fold_dd, rejected_oos_folds)
                     VALUES
                         (:tf, :computed_at, :best_params, :net_sharpe, :net_return,
                          :max_drawdown, :n_trades, :win_rate, :param_grid_size, :lookback_days,
                          :min_trades, :eligible_candidates, :total_candidates, :status, :rejection_reason,
                          :max_dd_used, :rejected_by_min_trades, :rejected_by_max_dd,
-                         :rejected_by_both, :max_trades_seen, :best_dd_seen)
+                         :rejected_by_both, :max_trades_seen, :best_dd_seen,
+                         :folds_used, :oos_trades, :oos_win_rate, :worst_fold_dd, :rejected_oos_folds)
                 """),
                 {
                     "tf": timeframe,
@@ -469,7 +518,53 @@ def save_calibration_result(
                     "rejected_by_both": getattr(result, "rejected_by_both", None),
                     "max_trades_seen": getattr(result, "max_trades_seen", None),
                     "best_dd_seen": getattr(result, "best_dd_seen", None),
+                    # WF OOS aggregate fields
+                    "folds_used": getattr(result, "folds_used", None),
+                    "oos_trades": getattr(result, "oos_trades", None),
+                    "oos_win_rate": getattr(result, "oos_win_rate", None),
+                    "worst_fold_dd": getattr(result, "worst_fold_dd", None),
+                    "rejected_oos_folds": getattr(result, "rejected_oos_folds", None),
                 },
             )
 
     _with_retry(_do)  # NFR-01
+
+
+def save_meta_model_run(
+    engine: Engine,
+    schema: str,
+    meta_run: dict,
+    output_cfg: OutputConfig,
+) -> None:
+    """Persist a meta-model training run's metadata to {schema}.meta_model_runs."""
+    if not output_cfg.enabled:
+        return
+    import json as _j
+    computed_at = _utcnow()
+
+    def _do() -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    INSERT INTO {schema}.meta_model_runs
+                        (timeframe, trained_at, n_samples, n_win, n_loss,
+                         auc, brier_score, features, threshold, model_path)
+                    VALUES
+                        (:tf, :trained_at, :n_samples, :n_win, :n_loss,
+                         :auc, :brier_score, :features, :threshold, :model_path)
+                """),
+                {
+                    "tf":          meta_run.get("timeframe"),
+                    "trained_at":  meta_run.get("trained_at", computed_at),
+                    "n_samples":   meta_run.get("n_samples"),
+                    "n_win":       meta_run.get("n_win"),
+                    "n_loss":      meta_run.get("n_loss"),
+                    "auc":         meta_run.get("auc"),
+                    "brier_score": meta_run.get("brier_score"),
+                    "features":    _j.dumps(meta_run.get("features", [])),
+                    "threshold":   meta_run.get("threshold"),
+                    "model_path":  meta_run.get("model_path"),
+                },
+            )
+
+    _with_retry(_do)
