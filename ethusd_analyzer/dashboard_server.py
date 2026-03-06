@@ -74,19 +74,43 @@ class DashboardServer:
 
     @staticmethod
     def _free_port(port: int) -> None:
-        """Kill any PID listening on *port* (excluding our own process)."""
+        """Attempt to stop a prior instance of this app listening on *port*.
+
+        Only kills a process if its command line clearly belongs to this
+        project (contains 'ethusd_analyzer').  If ownership cannot be
+        verified, logs a warning and does NOT kill.
+        """
+        import logging as _log
+        _logger = _log.getLogger(__name__)
         my_pid = os.getpid()
         try:
             result = subprocess.run(
                 ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=5,
             )
-            pids = [p for p in result.stdout.strip().split() if p]
+            pids = [p.strip() for p in result.stdout.strip().split() if p.strip()]
             for pid_str in pids:
                 try:
                     pid = int(pid_str)
-                    if pid != my_pid:
-                        os.kill(pid, signal.SIGKILL)
+                    if pid == my_pid:
+                        continue
+                    # Verify the process belongs to this project
+                    ps_result = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "command="],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    cmd_line = ps_result.stdout.strip()
+                    if "ethusd_analyzer" in cmd_line or "dashboard_server" in cmd_line:
+                        os.kill(pid, signal.SIGTERM)  # graceful first
+                        _logger.info(
+                            "[dashboard] Stopped prior instance pid=%d on port %d",
+                            pid, port,
+                        )
+                    else:
+                        _logger.warning(
+                            "[dashboard] Port %d occupied by unrelated process pid=%d (%s) — not killing",
+                            port, pid, cmd_line[:80],
+                        )
                 except (ProcessLookupError, ValueError):
                     pass
         except Exception:

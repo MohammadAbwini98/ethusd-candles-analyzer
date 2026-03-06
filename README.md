@@ -60,75 +60,24 @@ On startup, the program starts a local dashboard (default http://127.0.0.1:8787/
 All outputs are also written to Postgres under schema `ethusd_analytics`.
 
 
-cd /Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2
-.venv/bin/python -m ethusd_analyzer.run --config config.yaml
+## Secrets / Environment Variables
 
+Copy `.env.example` to `.env` and fill in your credentials:
+```bash
+cp .env.example .env
+# Edit .env with your values, then source it:
+source .env
+# Or export individually:
+export CAPITAL_API_KEY="your_key"
+export CAPITAL_EMAIL="your@email.com"
+export CAPITAL_PASSWORD="your_password"
+export TELEGRAM_BOT_TOKEN="your_bot_token"
+export EMAIL_PASSWORD="your_app_password"
+```
 
+See `.env.example` for the full list of supported environment variables.
 
-# ==============================================================
-# GoldBot — XAUUSD Trend-Following Bot
-# ==============================================================
-
-# ---- Capital.com API Credentials ----
-CAPITAL_API_KEY=b7ZKfX5nISJiJyYf
-CAPITAL_EMAIL=mohammad.abwini98@gmail.com
-CAPITAL_PASSWORD=/Mohammad6598
-
-# ---- Account Type ----
-# "live" or "demo"
-ACCOUNT_TYPE=live
-
-# ---- Account ID (optional) ----
-# Leave blank to use the preferred/default account.
-# Set to your demo account ID to run in demo mode.
-# Your accounts:
-#   307978579944232132 → Live account      ($25.67)
-#   308290261431431454 → Demo - Account    ($993.90)
-#   310891246381248798 → Demo - CFD Account ($1,000.00)  ← active in browser
-CAPITAL_ACCOUNT_ID=307978579944232132
-
-# ---- Instrument ----
-# Capital.com epic name. Examples: GOLD, SILVER, BTCUSD, ETHUSD, OIL_CRUDE, EURUSD, US500
-INSTRUMENT=ETHUSD
-
-# ---- Spread Filter ----
-# Max allowed spread in price units (tune per instrument)
-# GOLD=0.60 | ETHUSD=3.00 | BTCUSD=30.00 | SILVER=0.05 | EURUSD=0.0003
-SPREAD_MAX=3.00
-
-# ---- Strategy Toggles ----
-# Enable H1+H4 swing mode (in addition to M5 scalp)
-SWING_ENABLED=true
-
-cd /Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2
-source .venv/bin/activate
-export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN_HERE"
-# ---- Telegram Notifications ----
-# Bot token from @BotFather (set via TELEGRAM_BOT_TOKEN env var)
-# Chat ID to receive messages. Use your personal numeric ID (get it from @userinfobot),
-# or a public channel/group username like @mychannel where the bot is admin.
-TELEGRAM_CHAT_ID=1495017760
-
-# ---- Database (optional — ML data logging) ----
-# Leave blank to run without a database (trading is unaffected).
-# Example: postgresql://user:pass@localhost:5432/goldbot
-DB_URL=postgresql://mohammadabwini@localhost:5432/goldbot
-
-# ---- ML Confidence Gate (optional) ----
-# Applied after BOS + M1 micro-confirm. No-op until models/current.json exists.
-# BUY  entry: require p(up) >= ML_BUY_THRESHOLD
-# SELL entry: require p(up) <= ML_SELL_THRESHOLD  (i.e. p(down) >= 1 - threshold)
-ML_BUY_THRESHOLD=0.60
-ML_SELL_THRESHOLD=0.40
-
-export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN_HERE" && export PYTHONPATH="/Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2" && /Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2/.venv/bin/python -m ethusd_analyzer.telegram_notifier --test "hello" --config /Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2/config.yaml
-
-
-export TELEGRAM_BOT_TOKEN="YOUR_NEW_BOT_TOKEN" && export PYTHONPATH="/Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2:$PYTHONPATH" && /Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2/.venv/bin/python -m ethusd_analyzer.telegram_notifier --test "hello" --config /Users/mohammadabwini/Desktop/Workplace/ethusd_candles_analyzer_v1_2/config.yaml
-
-
-
-Notification Coverage Matrix
+## Notification Coverage Matrix
 Event Type	WhatsApp	Telegram	Email	macOS
 Startup	✅ (simple)	✅ (rich)	✅ (rich)	✅ (rich)
 Shutdown	✅ (simple)	✅ (rich)	✅ (rich)	✅ (sync)
@@ -137,3 +86,127 @@ Sanity Check Fail	✅	✅	✅	✅
 Calibration Warning	✅	✅	✅	✅
 System Error	✅	✅	✅	✅
 Daily Summary	✅	✅	✅	✅
+
+
+Because this line disables it globally:
+
+adaptive:
+  enabled: false
+
+With that value, the system stays in static-only mode even if all individual adaptive parameters are marked enabled: true.
+
+How it works:
+
+adaptive.enabled: false
+= master switch off
+= adaptive layer is not used in decisions
+
+adaptive.params.<name>.enabled: true
+= “this parameter is allowed to adapt” only if the global switch is on
+
+So your current config means:
+
+adaptive framework exists
+
+parameter-level adaptation is configured
+
+but the whole adaptive engine is intentionally disabled
+
+Why this is usually done by default:
+
+to preserve old behavior after deployment
+
+to avoid changing live trading immediately
+
+to let you test safely first
+
+to use shadow_mode before activating real adaptive decisions
+
+Your current state is effectively:
+
+static mode
+
+no adaptive values applied to entries/exits
+
+likely no adaptive logs either, because shadow_mode: false
+
+If you want adaptive logic active
+
+Change it to:
+
+adaptive:
+  enabled: true
+  shadow_mode: false
+
+That means:
+
+compute adaptive values
+
+use them in real decisions
+
+Safer first step
+
+Use:
+
+adaptive:
+  enabled: true
+  shadow_mode: true
+
+That means:
+
+compute adaptive values
+
+log them
+
+but keep live decisions on static baseline
+
+This is usually the best first rollout step.
+
+When each mode is useful
+enabled: false, shadow_mode: false
+
+Use when:
+
+you want original behavior only
+
+you are not testing adaptation yet
+
+enabled: true, shadow_mode: true
+
+Use when:
+
+you want to inspect adaptive values
+
+compare static vs adaptive behavior
+
+validate logs and formulas safely
+
+enabled: true, shadow_mode: false
+
+Use when:
+
+you already validated the adaptive layer
+
+you want adaptive values to affect trading decisions
+
+Important note
+
+If the code was written correctly, the expected priority is:
+
+if adaptive.enabled == false → ignore adaptive decisioning
+
+if adaptive.enabled == true and shadow_mode == true → compute/log only
+
+if adaptive.enabled == true and shadow_mode == false → compute and apply
+
+So the reason it is “turned off” is not a bug by itself — it is a deliberate default safety setting.
+
+Recommended next step for you:
+
+adaptive:
+  enabled: true
+  shadow_mode: true
+
+Run it first, inspect logs and signal outputs, then switch shadow_mode to false once the behavior looks correct.
+
+If you want, I can also tell you exactly what logs/output you should expect in shadow mode versus fully active adaptive mode.

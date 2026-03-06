@@ -66,16 +66,17 @@ class TelegramNotifier:
         self.retry_backoff_seconds = retry_backoff_seconds
         self.min_interval_seconds = min_interval_seconds
         self.rate_limit_enabled = rate_limit_enabled
-        
+
+        # Shared HTTP session for connection reuse
+        self._http = requests.Session()
+
         # Rate limiting state (per-process in-memory)
         self._last_send_time: float = 0.0
         self._lock = threading.Lock()
     
     def _log_token_safe(self) -> str:
-        """Return a safe token representation for logging."""
-        if len(self.bot_token) > 20:
-            return f"{self.bot_token[:10]}...{self.bot_token[-5:]}"
-        return "***"
+        """Return a safe token representation for logging (fully redacted)."""
+        return "***REDACTED***"
     
     def _post_send_message(
         self, chat_id: int, text: str, retry_count: int = 0
@@ -99,7 +100,7 @@ class TelegramNotifier:
         }
         
         try:
-            resp = requests.post(url, json=payload, timeout=self.timeout_seconds)
+            resp = self._http.post(url, json=payload, timeout=self.timeout_seconds)
             
             if resp.status_code == 200:
                 logger.debug(

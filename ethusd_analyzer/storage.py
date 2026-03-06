@@ -115,6 +115,8 @@ def init_schema_and_tables(engine: Engine, schema: str) -> None:
               id BIGSERIAL PRIMARY KEY,
               timeframe TEXT NOT NULL,
               computed_at TIMESTAMPTZ NOT NULL,
+              source_candle_ts TIMESTAMPTZ,
+              symbol TEXT DEFAULT 'ETHUSD',
               regime TEXT NOT NULL,
               signal TEXT NOT NULL,
               confidence DOUBLE PRECISION,
@@ -273,6 +275,14 @@ def init_schema_and_tables(engine: Engine, schema: str) -> None:
         f"""DO $$ BEGIN
             ALTER TABLE {schema}.signal_recommendations ADD COLUMN label_computed_at TIMESTAMPTZ;
         EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        # source_candle_ts: the closed candle that generated the signal
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN source_candle_ts TIMESTAMPTZ;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
+        # symbol column for multi-instrument support
+        f"""DO $$ BEGIN
+            ALTER TABLE {schema}.signal_recommendations ADD COLUMN symbol TEXT DEFAULT 'ETHUSD';
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$""",
     ]
 
     def _init():
@@ -423,17 +433,25 @@ def save_signal_recommendation(
     import json as _json2
     computed_at = _utcnow()
 
+    # Resolve source_candle_ts from the recommendation (may be None for legacy callers)
+    source_ts = getattr(rec, "source_candle_ts", None)
+    if source_ts is not None and hasattr(source_ts, "to_pydatetime"):
+        source_ts = source_ts.to_pydatetime()
+    rec_symbol = getattr(rec, "symbol", "ETHUSD")
+
     def _do() -> None:
         with engine.begin() as conn:
             conn.execute(
                 text(f"""
                     INSERT INTO {schema}.signal_recommendations
-                        (timeframe, computed_at, regime, signal, confidence, entry_price,
+                        (timeframe, computed_at, source_candle_ts, symbol,
+                         regime, signal, confidence, entry_price,
                          stop_loss, take_profit, hold_bars, reason,
                          conf_regime, conf_tail, conf_backtest,
                          rc, ar, score_mr, score_mom, volatility, params_json)
                     VALUES
-                        (:tf, :computed_at, :regime, :signal, :confidence, :entry_price,
+                        (:tf, :computed_at, :source_candle_ts, :symbol,
+                         :regime, :signal, :confidence, :entry_price,
                          :stop_loss, :take_profit, :hold_bars, :reason,
                          :conf_regime, :conf_tail, :conf_backtest,
                          :rc, :ar, :score_mr, :score_mom, :volatility, :params_json)
@@ -441,6 +459,8 @@ def save_signal_recommendation(
                 {
                     "tf": rec.timeframe,
                     "computed_at": computed_at,
+                    "source_candle_ts": source_ts,
+                    "symbol": rec_symbol,
                     "regime": rec.regime,
                     "signal": rec.signal,
                     "confidence": rec.confidence,

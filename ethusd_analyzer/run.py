@@ -19,7 +19,8 @@ from .utils import load_config, save_json, now_ts, send_alert, set_telegram_noti
 from .db import DbConfig, make_engine, fetch_candles
 from .analysis import add_features, add_strategy_features, resample_timeframe, correlation_table, lag_correlation, rolling_correlations
 from .storage import OutputConfig, init_schema_and_tables, save_snapshot, save_signal_recommendation, save_calibration_result, save_meta_model_run
-from .strategy import evaluate_timeframe, run_calibration, invalidate_meta_model_cache
+from .strategy import evaluate_timeframe, run_calibration, invalidate_meta_model_cache, resolve_effective_strategy_config
+from .adaptive import AdaptiveCache
 from .meta_labeler import label_signals
 from .meta_trainer import maybe_retrain
 from .dashboard_server import DashboardServer
@@ -304,6 +305,12 @@ def _run_strategy_cycle(
                 min_trades = int(cal_cfg.get("min_trades", 20))
                 # FR-18: per-timeframe calibration overrides
                 per_tf_cal = cal_cfg.get("per_timeframe", {}).get(tf)
+                # Use canonical config resolution so TF overrides apply to calibration gates
+                eff_cfg = resolve_effective_strategy_config(tf, strategy_cfg)
+                eff_gates = eff_cfg["gates"]
+                # Adaptive config for calibration parity
+                from .adaptive import AdaptiveConfig as _AdaCfg
+                _ada_cal_cfg = _AdaCfg.from_dict(strategy_cfg.get("adaptive"))
                 cal_result = run_calibration(
                     df_strat,
                     timeframe=tf,
@@ -314,10 +321,12 @@ def _run_strategy_cycle(
                     min_trades=min_trades,
                     walk_forward_folds=walk_forward_folds,   # FR-22
                     per_tf_overrides=per_tf_cal,             # FR-18
-                    stretch_z_min=float(gates_cfg.get("stretch_z_min", 0.0)),
-                    trend_min=float(gates_cfg.get("trend_min", 0.0)),
+                    stretch_z_min=float(eff_gates.get("stretch_z_min", 0.0)),
+                    trend_min=float(eff_gates.get("trend_min", 0.0)),
                     min_trades_oos=min_trades_oos,
                     min_folds_with_trades=min_folds_with_trades,
+                    adaptive_cfg=_ada_cal_cfg,
+                    base_config=eff_cfg,
                 )
                 # FR-35: structured calibration result log
                 logger.info(
@@ -367,12 +376,18 @@ def _run_strategy_cycle(
             except Exception as e:
                 logger.warning(f"[calibration][{tf}] failed: {e}")
 
-        # Signal evaluation with cooldown
+        # Signal evaluation with cooldown (bar-based, not loop-based)
         try:
             last_sig = calibration_state.get("last_signal", {}).get(tf)
-            # Increment bars_elapsed
-            if last_sig is not None:
-                last_sig["bars_elapsed"] = last_sig.get("bars_elapsed", 0) + 1
+            # Bar-based cooldown: only increment when a new closed candle is processed
+            last_candle_ts_tracker = calibration_state.setdefault("last_candle_ts", {})
+            current_last_ts = df_strat["market_time"].iloc[-1] if "market_time" in df_strat.columns and not df_strat.empty else None
+            prev_ts = last_candle_ts_tracker.get(tf)
+            new_bar_closed = (current_last_ts is not None and current_last_ts != prev_ts)
+            if new_bar_closed:
+                last_candle_ts_tracker[tf] = current_last_ts
+                if last_sig is not None:
+                    last_sig["bars_elapsed"] = last_sig.get("bars_elapsed", 0) + 1
 
             # FR-09: per-TF regime history buffer
             regime_hist = calibration_state.setdefault("regime_hist", {})
@@ -399,16 +414,20 @@ def _run_strategy_cycle(
                 persistence_k=persistence_k,                  # FR-09
                 persistence_m=persistence_m,                  # FR-09
                 symbol=epic_symbol,                           # FR-26
+                adaptive_cache=calibration_state.get("adaptive_cache"),  # adaptive bar-close cache
             )
             if rec is not None:
                 print(f"[signal][{tf}] {rec.signal} conf={rec.confidence:.2f} "
                       f"entry={rec.entry_price:.2f} TP={rec.take_profit:.2f} SL={rec.stop_loss:.2f} | {rec.reason}")
-                # FR-35: structured signal log
+                # FR-35: structured signal log with full audit fields
                 logger.info(
                     "[signal_fired] tf=%s signal=%s regime=%s conf=%.4f "
-                    "entry=%.2f tp=%.2f sl=%.2f symbol=%s",
+                    "entry=%.2f tp=%.2f sl=%.2f symbol=%s "
+                    "source_candle_ts=%s computed_at=%s params=%s",
                     tf, rec.signal, rec.regime, rec.confidence,
                     rec.entry_price, rec.take_profit, rec.stop_loss, rec.symbol,
+                    rec.source_candle_ts, datetime.now(timezone.utc).isoformat(),
+                    rec.params_json,
                 )
                 send_alert(
                     f"\U0001f7e2 [Signal][{tf}] {rec.signal} triggered \u2014 "
@@ -1187,8 +1206,10 @@ def main():
         "params": {},
         "sharpe": {},
         "last_signal": {},
-        "regime_hist": {},   # FR-09: per-TF regime classification history for K-of-M persistence
-        "meta": {},          # meta-model trainer state per-TF (last_trained_count, last_trained_ts)
+        "last_candle_ts": {},  # per-TF: last closed candle timestamp for bar-based cooldown
+        "regime_hist": {},     # FR-09: per-TF regime classification history for K-of-M persistence
+        "meta": {},            # meta-model trainer state per-TF (last_trained_count, last_trained_ts)
+        "adaptive_cache": AdaptiveCache(),  # adaptive parameter bar-close cache
     }
     if strategy_cfg.get("enabled"):
         print(f"[strategy] Enabled for timeframes: {sorted(strategy_tfs)}")

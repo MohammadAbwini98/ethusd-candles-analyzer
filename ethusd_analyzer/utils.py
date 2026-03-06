@@ -4,6 +4,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import copy, yaml, time, json, requests, threading
 
+# Shared HTTP session for connection reuse in alert delivery
+_http_session = requests.Session()
+
 @dataclass
 class Config:
     raw: Dict[str, Any]
@@ -34,7 +37,22 @@ class Config:
 
 def load_config(path: str) -> Config:
     p = Path(path)
-    return Config(raw=yaml.safe_load(p.read_text(encoding="utf-8")))
+    raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+
+    from .config_secrets import resolve_secrets, validate_no_hardcoded_secrets
+
+    # Overlay env-var secrets onto the raw config
+    secret_warnings = resolve_secrets(raw)
+    if secret_warnings:
+        for w in secret_warnings:
+            print(f"[config] WARNING: {w}")
+
+    # Warn about hardcoded secrets still in config file
+    hardcoded = validate_no_hardcoded_secrets(raw)
+    for h in hardcoded:
+        print(f"[config] SECURITY: {h}")
+
+    return Config(raw=raw)
 
 def now_ts() -> float:
     return time.time()
@@ -219,7 +237,7 @@ def send_alert(message: str, cfg: Dict[str, Any], alert_type: str = "general") -
             for attempt in range(5):
                 _notif_tracker.record_attempt("whatsapp")
                 try:
-                    resp = requests.post(url, json={"message": msg}, timeout=timeout)
+                    resp = _http_session.post(url, json={"message": msg}, timeout=timeout)
                     resp.raise_for_status()
                     _notif_tracker.record_success("whatsapp")
                     return  # delivered (or queued by notifier)

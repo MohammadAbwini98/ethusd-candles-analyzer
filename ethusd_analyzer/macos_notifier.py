@@ -124,54 +124,50 @@ class MacOSNotifier:
     def _notify_osascript(
         self, title: str, message: str, subtitle: Optional[str] = None
     ) -> bool:
-        """Send notification via osascript.
-        
+        """Send notification via osascript (no shell=True).
+
         Args:
             title: Notification title
             message: Notification message
             subtitle: Optional subtitle
-        
+
         Returns:
             True if successful, False on failure
         """
         try:
-            # Escape quotes for AppleScript
-            title = title.replace('"', '\\"')
-            message = message.replace('"', '\\"')
-            subtitle = subtitle.replace('"', '\\"') if subtitle else ""
-            
-            # Limit length to avoid AppleScript errors
-            title = title[:100]
-            message = message[:500]
-            subtitle = subtitle[:100] if subtitle else ""
-            
-            # Build AppleScript command
-            parts = [f'display notification "{message}" with title "{title}"']
-            if subtitle:
-                parts.append(f'subtitle "{subtitle}"')
+            # Escape double-quotes for AppleScript string literals
+            def _esc(s: str) -> str:
+                return s.replace("\\", "\\\\").replace('"', '\\"')
+
+            t = _esc(title[:100])
+            m = _esc(message[:500])
+            s = _esc(subtitle[:100]) if subtitle else ""
+
+            # Build AppleScript source
+            parts = [f'display notification "{m}" with title "{t}"']
+            if s:
+                parts.append(f'subtitle "{s}"')
             if self.sound:
-                parts.append(f'sound name "{self.sound}"')
-            
-            cmd = " ".join(parts)
-            script = f'osascript -e \'{cmd}\''
-            
+                parts.append(f'sound name "{_esc(self.sound)}"')
+            applescript = " ".join(parts)
+
+            # Pass AppleScript via -e argument list (no shell)
             result = subprocess.run(
-                script,
-                shell=True,
+                ["osascript", "-e", applescript],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=self.timeout_seconds,
                 text=True,
             )
-            
+
             if result.returncode != 0:
                 logger.warning(
                     "[macos] osascript failed: %s", result.stderr.strip()
                 )
                 return False
-            
+
             return True
-            
+
         except subprocess.TimeoutExpired:
             logger.warning("[macos] osascript timed out")
             return False

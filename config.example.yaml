@@ -1,33 +1,31 @@
 # Data source: "capital_api" (fetch from Capital.com) or "db_table" (read external table)
 data_source: capital_api
 
-# Capital.com API credentials & settings
+# Capital.com API credentials — loaded from env vars:
+#   CAPITAL_API_KEY, CAPITAL_EMAIL, CAPITAL_PASSWORD
 capital:
-  api_key: "YOUR_CAPITAL_API_KEY"
-  email: "your@email.com"
-  password: "YOUR_PASSWORD"
+  api_key: ""        # or set CAPITAL_API_KEY env var
+  email: ""          # or set CAPITAL_EMAIL env var
+  password: ""       # or set CAPITAL_PASSWORD env var
   base_url: https://api-capital.backend-capital.com
   epic: ETHUSD
-  backfill_enabled: true   # set to false to skip historical backfill on startup
-  # Live polling intervals (seconds)
+  backfill_enabled: true
   tick_poll_seconds: 1
   sentiment_poll_seconds: 30
-  candle_poll_seconds: 65    # how often to fetch new closed 1m candles from /api/v1/prices (> 60s)
+  candle_poll_seconds: 65
 
 db:
   host: localhost
   port: 5432
   database: goldbot
   username: YOUR_DB_USER
-  password: ""   # no password required
+  password: ""       # or set DB_PASSWORD env var
 
-# Legacy table (used when data_source=db_table)
 table: candles
 
 filters:
   epic: ETHUSD
 
-# Column mapping (matches both legacy and new ethusd_analytics.candles table)
 columns:
   time: ts
   close: close
@@ -39,7 +37,7 @@ columns:
 stream:
   poll_seconds: 10
   history_hours: 720
-  max_bars: 20000
+  max_bars: 50000
   save_every_seconds: 60
 
 analysis:
@@ -60,28 +58,34 @@ db_output:
   enabled: true
   schema: ethusd_analytics
   store_rolling_points: 500
-  retain_days: 14
-  enable_perf_tables: false   # FR-29: set true to create strategy_runs/trades/equity tables
+  retain_days: 45
+  enable_perf_tables: false
 
 strategy:
   enabled: true
   timeframes: ["1m", "5m", "15m", "30m"]
   cooldown_bars: 3
-  symbol: ETHUSD      # FR-26
+  symbol: ETHUSD
   regime:
     mom_span: 20
     vol_window: 20
     regime_corr_window: 50
-    r_min: 0.10
-    a_min: 0.10
-    # FR-09: K-of-M regime persistence (set persistence_m > 1 to enable)
-    persistence_k: 2    # minimum occurrences required
-    persistence_m: 3    # rolling window size
+    r_min: 0.05
+    a_min: 0.05
+    persistence_k: 2
+    persistence_m: 3
   signal:
     quantile_window: 200
-    quantile_hi: 0.90
-    quantile_lo: 0.10
+    quantile_hi: 0.95
+    quantile_lo: 0.05
     mom_k: 1.5
+  gates:
+    ema_fast_span: 20
+    ema_slow_span: 50
+    stretch_baseline_span: 50
+    stretch_window: 200
+    stretch_z_min: 1.0
+    trend_min: 0.002
   calibration:
     enabled: true
     interval_minutes: 60
@@ -89,41 +93,51 @@ strategy:
     cost_bps: 10
     min_trades: 20
     max_drawdown: 0.15
-    walk_forward_folds: 1    # FR-22: set > 1 to enable rolling walk-forward (e.g. 3 or 5)
+    walk_forward_folds: 5
+    min_trades_oos: 10
+    min_folds_with_trades: 3
     grid:
-      r_min: [0.05, 0.10, 0.15]
+      r_min: [0.03, 0.05, 0.10]
       quantile_window: [150, 200, 300]
       quantile_levels: [[0.85, 0.15], [0.90, 0.10], [0.95, 0.05]]
       hold_bars: [1, 2, 3]
       cost_bps: [5, 10, 15]
-    # FR-18: per-timeframe calibration overrides (override TF-aware code defaults if set)
-    # NOTE: TF-aware defaults already embedded in run_calibration():
-    #   min_trades: 1m=80, 5m=30, 15m=15, 30m=8
-    #   max_drawdown: 1m=0.15, 5m=0.15, 15m=0.18, 30m=0.20
-    # These per_timeframe entries override those defaults. Remove or comment to use code defaults.
     per_timeframe:
       1m:
         min_trades: 80
-        max_drawdown: 1.50    # cumulative equity-curve DD; scales with ~1800 trades/lookback
+        max_drawdown: 0.50
         lookback_days: 7
+        walk_forward_folds: 3
+        min_trades_oos: 40
+        min_folds_with_trades: 2
       5m:
-        min_trades: 30
-        max_drawdown: 0.30
-        lookback_days: 14
+        min_trades: 20
+        max_drawdown: 0.45
+        lookback_days: 45
+        walk_forward_folds: 3
+        min_trades_oos: 12
+        min_folds_with_trades: 2
       15m:
-        min_trades: 15
-        max_drawdown: 0.18
-        lookback_days: 21
+        min_trades: 10
+        max_drawdown: 0.25
+        lookback_days: 30
+        walk_forward_folds: 5
+        min_trades_oos: 5
+        min_folds_with_trades: 2
       30m:
         min_trades: 8
         max_drawdown: 0.20
         lookback_days: 30
-  # FR-14: per-timeframe signal threshold overrides
+        walk_forward_folds: 5
+        min_trades_oos: 4
+        min_folds_with_trades: 2
   timeframe_overrides:
     1m:
       signal:
-        mom_k: 2.0
+        mom_k: 1.5
     30m:
+      gates:
+        stretch_z_min: 0.5
       confidence:
         min_confidence: 0.60
   tp_sl:
@@ -131,26 +145,118 @@ strategy:
     mr_sl_mult: 1.2
     mom_tp_mult: 2.0
     mom_sl_mult: 1.0
+  meta_model:
+    enabled: false
+    threshold_long: 0.58
+    threshold_short: 0.58
+    min_samples_to_enable: 500
+    retrain_min_new_samples: 200
+    retrain_every_hours: 24.0
+    regularization_C: 0.1
+    val_fraction: 0.20
+    model_dir: outputs/models
   confidence:
     min_confidence: 0.55
     weight_regime: 0.5
     weight_tail: 0.3
     weight_backtest: 0.2
     regime_denom: 0.25
+  # ── Adaptive strategy parameters ─────────────────────────────
+  # Derives bounded effective values from current market state.
+  # Static baseline values remain the source of truth; adaptive logic
+  # overlays adjustments clamped to explicit [min, max] bounds.
+  # Set enabled: false to use only static baseline parameters.
+  adaptive:
+    enabled: false              # global kill switch — false = static-only mode
+    shadow_mode: false          # true = compute + log adaptive values without using them
+    update_mode: bar_close      # only update on bar close (the only supported mode)
+    lookback_bars: 100          # rolling window for percentile computations
+    params:
+      trend_min:                # gates.trend_min — ↑ in chop+high-vol
+        enabled: true
+        min: 0.0005
+        max: 0.01
+      stretch_z_min:            # gates.stretch_z_min — ↑ in high-vol
+        enabled: true
+        min: 0.3
+        max: 2.5
+      mom_k:                    # signal.mom_k — ↑ in chop
+        enabled: true
+        min: 0.8
+        max: 3.0
+      min_confidence:           # confidence.min_confidence — ↑ in weak regime
+        enabled: true
+        min: 0.35
+        max: 0.85
+      mr_tp_mult:               # tp_sl.mr_tp_mult — widen in high-vol
+        enabled: true
+        min: 0.5
+        max: 2.0
+      mr_sl_mult:               # tp_sl.mr_sl_mult — widen in high-vol
+        enabled: true
+        min: 0.5
+        max: 2.5
+      mom_tp_mult:              # tp_sl.mom_tp_mult — widen in strong trends
+        enabled: true
+        min: 1.0
+        max: 4.0
+      mom_sl_mult:              # tp_sl.mom_sl_mult — widen in high-vol
+        enabled: true
+        min: 0.5
+        max: 2.0
+    # Optional per-timeframe bound overrides:
+    # per_timeframe:
+    #   30m:
+    #     trend_min: {min: 0.0003, max: 0.005}
 
 alerts:
-  enabled: true
+  enabled: false
   whatsapp_notifier_url: "http://127.0.0.1:3099/send"
-  wa_number: "YOUR_WHATSAPP_NUMBER"   # e.g. 962789200300 (country code + digits, no leading +)
+  wa_number: ""
   timeout_seconds: 3
+  telegram:
+    enabled: false
+    bot_token: ""          # Set TELEGRAM_BOT_TOKEN env var
+    chat_ids: []
+    parse_mode: "HTML"
+    disable_web_page_preview: true
+    timeout_seconds: 5
+    max_retries: 3
+    retry_backoff_seconds: 1.5
+    rate_limit:
+      enabled: true
+      min_interval_seconds: 1.0
+  macos:
+    enabled: true
+    method: "auto"
+    app_name: "ETH Analyzer"
+    title: "Trading Bot"
+    sound: "Ping"
+    timeout_seconds: 2
+    rate_limit:
+      enabled: true
+      min_interval_seconds: 1.0
+    dedupe:
+      enabled: true
   events:
+    startup: true
+    shutdown: true
     signal_fired: true
     calibration_warning: true
     sanity_check_fail: true
     daily_summary: true
     system_error: true
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    use_tls: true
+    from_email: ""         # your-sender@gmail.com
+    from_password: ""      # Set EMAIL_PASSWORD env var
+    to_emails: []
+    subject_prefix: "[ETH Analyzer]"
   rate_limit:
     enabled: true
     window_seconds: 60
     max_per_window: 10
-  daily_summary_hour_utc: 21   # UTC hour to emit daily P&L digest (e.g. 21 = 00:00 Jordan time)
+  daily_summary_hour_utc: 21

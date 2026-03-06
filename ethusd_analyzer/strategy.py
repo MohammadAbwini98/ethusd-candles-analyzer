@@ -10,6 +10,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .adaptive import (
+    AdaptiveCache,
+    AdaptiveConfig,
+    AdaptiveResult,
+    MarketState,
+    compute_adaptive_strategy_params,
+    compute_market_state,
+    precompute_adaptive_arrays,
+    resolve_effective_adaptive_config,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +59,7 @@ class TradeRecommendation:
     volatility: float
     params_json: Optional[Dict[str, Any]] = None
     symbol: str = "ETHUSD"  # FR-26
+    source_candle_ts: Optional[Any] = None  # timestamp of the closed candle that generated this signal
 
 
 @dataclass
@@ -406,8 +418,15 @@ def _simulate_strategy(
     mom_k: float = 1.5,
     stretch_z_min: float = 0.0,   # price gate: |price_z| min (0 = disabled)
     trend_min: float = 0.0,        # trend gate: |trend_strength| min (0 = disabled)
+    adaptive_arrays: Optional[Dict[str, np.ndarray]] = None,  # per-bar adaptive effective values
 ) -> Tuple[float, float, float, int, float]:
-    """Simulate strategy over historical data, return (sharpe, return, max_dd, n_trades, win_rate)."""
+    """Simulate strategy over historical data, return (sharpe, return, max_dd, n_trades, win_rate).
+
+    When *adaptive_arrays* is provided (from ``precompute_adaptive_arrays``),
+    per-bar effective values for ``stretch_z_min``, ``trend_min``, and
+    ``mom_k`` are used instead of the scalar defaults.  This ensures
+    calibration/backtest evaluation applies the same adaptive logic as runtime.
+    """
     n = len(df)
     min_bars = quantile_window + 10
     if n < min_bars:
@@ -430,6 +449,11 @@ def _simulate_strategy(
 
     # Mom threshold series
     mom_std_series = df["score_mom"].rolling(quantile_window, min_periods=quantile_window).std().values
+
+    # Adaptive per-bar arrays (None → fallback to scalar params)
+    _ada_mom_k = adaptive_arrays["mom_k"] if adaptive_arrays is not None else None
+    _ada_sz_min = adaptive_arrays["stretch_z_min"] if adaptive_arrays is not None else None
+    _ada_tm = adaptive_arrays["trend_min"] if adaptive_arrays is not None else None
 
     cost_frac = cost_bps / 10000.0
     pnl_list: List[float] = []
@@ -460,7 +484,8 @@ def _simulate_strategy(
         q_hi_val = q_hi_series[i]
         q_lo_val = q_lo_series[i]
         mom_std_val = mom_std_series[i]
-        mom_threshold = mom_k * mom_std_val if not np.isnan(mom_std_val) else 0.0
+        mom_k_i = float(_ada_mom_k[i]) if _ada_mom_k is not None else mom_k
+        mom_threshold = mom_k_i * mom_std_val if not np.isnan(mom_std_val) else 0.0
 
         signal = generate_signal(
             regime,
@@ -476,11 +501,13 @@ def _simulate_strategy(
             continue
 
         # Price gate check (fast-path: skipped when both thresholds are 0)
-        if stretch_z_min > 0.0 or trend_min > 0.0:
+        sz_min_i = float(_ada_sz_min[i]) if _ada_sz_min is not None else stretch_z_min
+        tm_i = float(_ada_tm[i]) if _ada_tm is not None else trend_min
+        if sz_min_i > 0.0 or tm_i > 0.0:
             gate_ok, _ = _check_price_gates(
                 regime, signal,
                 float(price_z_arr[i]), float(trend_str_arr[i]),
-                stretch_z_min, trend_min,
+                sz_min_i, tm_i,
             )
             if not gate_ok:
                 _dbg_no_signal += 1
@@ -572,6 +599,8 @@ def run_calibration(
     trend_min: float = 0.0,               # trend gate threshold (0 = disabled)
     min_trades_oos: int = 0,              # WF: min OOS trades per fold to count as valid (0=auto)
     min_folds_with_trades: int = 1,       # WF: min folds with valid OOS trades to accept a candidate
+    adaptive_cfg: Optional[AdaptiveConfig] = None,    # adaptive layer config
+    base_config: Optional[Dict[str, Any]] = None,     # resolved base config for adaptive precomputation
 ) -> CalibrationResult:
     """Walk-forward grid-search calibration with in-sample / out-of-sample split.
 
@@ -650,12 +679,20 @@ def run_calibration(
             min_trades_oos=min_trades_oos,
             min_folds_with_trades=min_folds_with_trades,
             stretch_z_min=stretch_z_min, trend_min=trend_min,
+            adaptive_cfg=adaptive_cfg, base_config=base_config,
         )
 
     # ── Single IS / OOS split (classic) ──────────────────────────────────────
     split_idx = int(len(df_cal) * (1.0 - oos_fraction))
     df_is = df_cal.iloc[:split_idx].copy().reset_index(drop=True)
     df_oos = df_cal.iloc[split_idx:].copy().reset_index(drop=True)
+
+    # Precompute per-bar adaptive arrays (once per df, reused across all candidates)
+    _ada_is: Optional[Dict[str, np.ndarray]] = None
+    _ada_oos: Optional[Dict[str, np.ndarray]] = None
+    if adaptive_cfg is not None and adaptive_cfg.enabled and base_config is not None:
+        _ada_is = precompute_adaptive_arrays(df_is, base_config, adaptive_cfg, timeframe)
+        _ada_oos = precompute_adaptive_arrays(df_oos, base_config, adaptive_cfg, timeframe)
 
     best_tuple = (-np.inf, -np.inf, np.inf)   # (sharpe, net_return, -max_dd) — FR-20
     best_is_result: Tuple[float, float, float, int, float] = (-999.0, 0.0, 1.0, 0, 0.0)
@@ -674,6 +711,7 @@ def run_calibration(
         sharpe, total_ret, max_dd, n_trades, win_rate = _simulate_strategy(
             df_is, r_min, r_min, q_window, q_hi_pct, q_lo_pct, hold_bars, cost_bps,
             stretch_z_min=stretch_z_min, trend_min=trend_min,
+            adaptive_arrays=_ada_is,
         )
         # FR-19: track observed extremes
         max_trades_seen = max(max_trades_seen, n_trades)
@@ -761,6 +799,7 @@ def run_calibration(
         best_params["quantile_hi"], best_params["quantile_lo"],
         best_params["hold_bars"], best_params["cost_bps"],
         stretch_z_min=stretch_z_min, trend_min=trend_min,
+        adaptive_arrays=_ada_oos,
     )
 
     # Report OOS metrics (use OOS for final metrics — more honest)
@@ -815,6 +854,8 @@ def _run_walk_forward_calibration(
     min_folds_with_trades: int = 1,
     stretch_z_min: float = 0.0,
     trend_min: float = 0.0,
+    adaptive_cfg: Optional[AdaptiveConfig] = None,
+    base_config: Optional[Dict[str, Any]] = None,
 ) -> CalibrationResult:
     """Expanding-window walk-forward calibration — candidate-centric OOS selection.
 
@@ -865,6 +906,20 @@ def _run_walk_forward_calibration(
             ),
         )
 
+    # Precompute per-bar adaptive arrays for each fold (once per df, reused across candidates)
+    _ada_enabled = (
+        adaptive_cfg is not None and adaptive_cfg.enabled and base_config is not None
+    )
+    fold_ada_arrays: List[Tuple[Optional[Dict[str, np.ndarray]], Optional[Dict[str, np.ndarray]]]] = []
+    for df_is_f, df_oos_f in folds:
+        if _ada_enabled:
+            assert adaptive_cfg is not None and base_config is not None
+            ada_is = precompute_adaptive_arrays(df_is_f, base_config, adaptive_cfg, timeframe)
+            ada_oos = precompute_adaptive_arrays(df_oos_f, base_config, adaptive_cfg, timeframe)
+            fold_ada_arrays.append((ada_is, ada_oos))
+        else:
+            fold_ada_arrays.append((None, None))
+
     # Effective fold threshold — cannot exceed the folds we actually have
     _eff_min_folds = max(1, min(min_folds_with_trades, n_valid_folds))
     # Effective per-fold OOS min trades (floor at 2 to always require real activity)
@@ -885,11 +940,14 @@ def _run_walk_forward_calibration(
         q_hi, q_lo = float(q_levels[0]), float(q_levels[1])
         fold_oos: List[Tuple[float, float, float, int, float]] = []
 
-        for df_is_f, df_oos_f in folds:
+        for fold_idx, (df_is_f, df_oos_f) in enumerate(folds):
+            ada_is_f, ada_oos_f = fold_ada_arrays[fold_idx]
+
             # IS evaluation — tracking + pre-filter
             is_sh, is_ret, is_dd, is_nt, is_wr = _simulate_strategy(
                 df_is_f, r_min, r_min, q_window, q_hi, q_lo, hold_bars, cost_bps,
                 stretch_z_min=stretch_z_min, trend_min=trend_min,
+                adaptive_arrays=ada_is_f,
             )
             max_trades_seen = max(max_trades_seen, is_nt)
             if is_dd < best_dd_seen:
@@ -910,6 +968,7 @@ def _run_walk_forward_calibration(
             oos_sh, oos_ret, oos_dd, oos_nt, oos_wr = _simulate_strategy(
                 df_oos_f, r_min, r_min, q_window, q_hi, q_lo, hold_bars, cost_bps,
                 stretch_z_min=stretch_z_min, trend_min=trend_min,
+                adaptive_arrays=ada_oos_f,
             )
             if oos_nt >= 2 and not np.isnan(oos_sh) and oos_sh > -999.0:
                 fold_oos.append((oos_sh, oos_ret, oos_dd, oos_nt, oos_wr))
@@ -1007,6 +1066,40 @@ def _run_walk_forward_calibration(
     )
 
 
+# ── Canonical Config Resolution ────────────────────────────────
+
+def resolve_effective_strategy_config(
+    timeframe: str,
+    strategy_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve the effective strategy config for a given timeframe.
+
+    Merges global defaults with timeframe_overrides for all sections:
+    regime, signal, gates, tp_sl, confidence, meta_model.
+
+    This is the ONE authoritative path used by both runtime evaluation
+    and calibration so that parameters are always identical.
+    """
+    tf_overrides = strategy_cfg.get("timeframe_overrides", {}).get(timeframe, {})
+
+    def _merge(section: str) -> Dict[str, Any]:
+        base = dict(strategy_cfg.get(section, {}))
+        base.update(tf_overrides.get(section, {}))
+        return base
+
+    return {
+        "regime": _merge("regime"),
+        "signal": _merge("signal"),
+        "gates": _merge("gates"),
+        "tp_sl": _merge("tp_sl"),
+        "confidence": _merge("confidence"),
+        "meta_model": _merge("meta_model"),
+        "calibration": dict(strategy_cfg.get("calibration", {})),
+        "cooldown_bars": int(strategy_cfg.get("cooldown_bars", 3)),
+        "symbol": str(strategy_cfg.get("symbol", "ETHUSD")),
+    }
+
+
 # ── Main Evaluator (per timeframe, per cycle) ────────────────
 
 def evaluate_timeframe(
@@ -1022,22 +1115,61 @@ def evaluate_timeframe(
     persistence_k: int = 1,                              # FR-09: min occurrences required
     persistence_m: int = 1,                              # FR-09: rolling window size
     symbol: str = "ETHUSD",                              # FR-26
+    adaptive_cache: Optional[AdaptiveCache] = None,      # adaptive bar-close cache
 ) -> Optional[TradeRecommendation]:
     """Run the full strategy pipeline for one timeframe. Returns a recommendation or None."""
     if len(df_feat) < 60:
         return None
 
-    regime_cfg = strategy_cfg.get("regime", {})
-    signal_cfg = strategy_cfg.get("signal", {})
-    tp_sl_cfg = strategy_cfg.get("tp_sl", {})
-    conf_cfg = strategy_cfg.get("confidence", {})
+    # Canonical config resolution: one path for all sections
+    eff = resolve_effective_strategy_config(timeframe, strategy_cfg)
+    regime_cfg = eff["regime"]
+    signal_cfg = eff["signal"]
+    tp_sl_cfg = eff["tp_sl"]
+    conf_cfg = eff["confidence"]
 
-    # FR-14: apply per-timeframe overrides on top of global config
-    if tf_overrides:
-        regime_cfg = {**regime_cfg, **tf_overrides.get("regime", {})}
-        signal_cfg = {**signal_cfg, **tf_overrides.get("signal", {})}
-        tp_sl_cfg = {**tp_sl_cfg, **tf_overrides.get("tp_sl", {})}
-        conf_cfg = {**conf_cfg, **tf_overrides.get("confidence", {})}
+    # ── Adaptive parameter layer ──────────────────────────────
+    adaptive_cfg = AdaptiveConfig.from_dict(strategy_cfg.get("adaptive"))
+    adaptive_result: Optional[AdaptiveResult] = None
+
+    if adaptive_cfg.enabled:
+        # Check cache: same bar → same adaptive values (no intra-bar drift)
+        last_ts = df_feat["market_time"].iloc[-1] if "market_time" in df_feat.columns and not df_feat.empty else None
+        if adaptive_cache is not None and last_ts is not None:
+            adaptive_result = adaptive_cache.get(timeframe, last_ts)
+
+        if adaptive_result is None:
+            mkt_state = compute_market_state(
+                df_feat,
+                lookback_bars=adaptive_cfg.lookback_bars,
+                regime_denom=float(conf_cfg.get("regime_denom", 0.25)),
+            )
+            adaptive_result = compute_adaptive_strategy_params(
+                eff, mkt_state, adaptive_cfg, timeframe=timeframe,
+            )
+            if adaptive_cache is not None and last_ts is not None:
+                adaptive_cache.put(timeframe, last_ts, adaptive_result)
+
+        # Merge adaptive effective values into resolved config
+        eff = resolve_effective_adaptive_config(eff, adaptive_result)
+        signal_cfg = eff["signal"]
+        tp_sl_cfg = eff["tp_sl"]
+        conf_cfg = eff["confidence"]
+
+        # Log adaptive audit trail
+        if adaptive_result.shadow_mode:
+            logger.info(
+                "[adaptive_shadow][%s] %s",
+                timeframe, adaptive_result.to_audit_dict(),
+            )
+        else:
+            logger.debug(
+                "[adaptive][%s] effective=%s deltas=%s reasons=%s",
+                timeframe,
+                {k: round(v, 6) for k, v in adaptive_result.effective_values.items()},
+                {k: round(v, 6) for k, v in adaptive_result.deltas.items()},
+                adaptive_result.reasons,
+            )
 
     # Use calibrated params if available, else config defaults
     cal = calibration_params or {}
@@ -1106,9 +1238,8 @@ def evaluate_timeframe(
         return None
 
     # Price-confirmation gates (disabled by default; thresholds = 0 means no filter)
-    gates_cfg: Dict[str, Any] = strategy_cfg.get("gates", {})
-    if tf_overrides:
-        gates_cfg = {**gates_cfg, **tf_overrides.get("gates", {})}
+    # Uses effective (post-adaptive) values from eff dict
+    gates_cfg: Dict[str, Any] = eff["gates"]
     stretch_z_min = float(gates_cfg.get("stretch_z_min", 0.0))
     trend_min     = float(gates_cfg.get("trend_min", 0.0))
     _pz = last.get("price_z")
@@ -1165,9 +1296,7 @@ def evaluate_timeframe(
     # Runs AFTER confidence (uses c_regime/c_tail/c_bt as features) and
     # AFTER min_confidence check (avoid wasting inference on already-rejected signals).
     # Falls back silently (no block) when model is absent or feature build fails.
-    meta_cfg: Dict[str, Any] = strategy_cfg.get("meta_model", {})
-    if tf_overrides:
-        meta_cfg = {**meta_cfg, **tf_overrides.get("meta_model", {})}
+    meta_cfg: Dict[str, Any] = eff["meta_model"]
     _meta_p_win: Optional[float] = None
     if meta_cfg.get("enabled", False):
         _feat_vec = _build_meta_features(
@@ -1208,7 +1337,7 @@ def evaluate_timeframe(
     # Active params for audit (includes gate values for dashboard display)
     _pz_json = round(price_z_val,   4) if not np.isnan(price_z_val)  else None
     _ts_json = round(trend_str_val, 6) if not np.isnan(trend_str_val) else None
-    active_params = {
+    active_params: Dict[str, Any] = {
         "r_min": r_min, "a_min": a_min,
         "quantile_window": q_window,
         "quantile_hi": q_hi_pct, "quantile_lo": q_lo_pct,
@@ -1219,6 +1348,17 @@ def evaluate_timeframe(
     if _meta_p_win is not None:
         active_params["meta_p_win"] = round(_meta_p_win, 4)
         parts.append(f"meta_p_win={_meta_p_win:.3f}✓")
+
+    # Attach adaptive audit trace when adaptive is active
+    if adaptive_result is not None:
+        active_params["adaptive"] = adaptive_result.to_audit_dict()
+        if not adaptive_result.shadow_mode:
+            parts.append("adaptive=ON")
+        else:
+            parts.append("adaptive=SHADOW")
+
+    # Source candle timestamp: the closed bar that generated this signal
+    _source_ts = last.get("market_time") if "market_time" in df_feat.columns else None
 
     return TradeRecommendation(
         timeframe=timeframe,
@@ -1240,4 +1380,5 @@ def evaluate_timeframe(
         volatility=round(vol, 8),
         params_json=active_params,
         symbol=symbol,
+        source_candle_ts=_source_ts,
     )

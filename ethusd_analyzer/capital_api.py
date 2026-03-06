@@ -29,11 +29,13 @@ class CapitalSession:
         self._cst: Optional[str] = None
         self._security_token: Optional[str] = None
         self._last_auth: float = 0.0
+        # Reuse HTTP connections via requests.Session (connection pooling)
+        self._http = requests.Session()
 
     # ── authentication ──────────────────────────────────────────
 
     def _authenticate(self) -> None:
-        resp = requests.post(
+        resp = self._http.post(
             f"{self.base_url}/api/v1/session",
             json={
                 "identifier": self.email,
@@ -90,7 +92,7 @@ class CapitalSession:
 
     def get_prices(self, epic: str, resolution: str, max_count: int = 1000) -> List[Dict]:
         """GET /api/v1/prices/{epic} — returns list of candle dicts."""
-        resp = requests.get(
+        resp = self._http.get(
             f"{self.base_url}/api/v1/prices/{epic}",
             params={"resolution": resolution, "max": max_count},
             headers=self._headers,
@@ -109,7 +111,7 @@ class CapitalSession:
             "from": self._iso(start),
             "to": self._iso(end),
         }
-        resp = requests.get(
+        resp = self._http.get(
             f"{self.base_url}/api/v1/prices/{epic}",
             params=params,
             headers=self._headers,
@@ -137,7 +139,7 @@ class CapitalSession:
 
     def get_live_price(self, epic: str) -> Dict:
         """GET /api/v1/markets/{epic} — current bid/ask/mid + market status."""
-        resp = requests.get(
+        resp = self._http.get(
             f"{self.base_url}/api/v1/markets/{epic}",
             headers=self._headers,
             timeout=10,
@@ -157,7 +159,7 @@ class CapitalSession:
 
     def get_sentiment(self, epic: str) -> Dict:
         """GET /api/v1/clientsentiment/{epic} — buyers % / sellers %."""
-        resp = requests.get(
+        resp = self._http.get(
             f"{self.base_url}/api/v1/clientsentiment/{epic}",
             headers=self._headers,
             timeout=10,

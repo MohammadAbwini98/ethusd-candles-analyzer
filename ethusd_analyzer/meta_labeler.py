@@ -48,7 +48,9 @@ def label_signals(
     with engine.connect() as conn:
         result = conn.execute(
             text(f"""
-                SELECT id, computed_at, signal, hold_bars, entry_price, params_json
+                SELECT id, computed_at,
+                       COALESCE(source_candle_ts, computed_at) AS entry_ts_effective,
+                       signal, hold_bars, entry_price, params_json
                 FROM {schema}.signal_recommendations
                 WHERE timeframe = :tf
                   AND outcome IS NULL
@@ -69,7 +71,8 @@ def label_signals(
     for row in rows:
         hold_bars = int(row.hold_bars or 2)
         min_age = timedelta(minutes=(hold_bars + 1) * tf_minutes)
-        entry_ts = row.computed_at
+        # Use source_candle_ts (via COALESCE alias) for correct bar alignment
+        entry_ts = row.entry_ts_effective
         if entry_ts.tzinfo is None:
             entry_ts = entry_ts.replace(tzinfo=timezone.utc)
         if now_utc >= entry_ts + min_age:
@@ -80,7 +83,7 @@ def label_signals(
 
     # ── Batch-fetch all candles needed ───────────────────────────────────────
     all_ts = [
-        r.computed_at.replace(tzinfo=timezone.utc) if r.computed_at.tzinfo is None else r.computed_at
+        r.entry_ts_effective.replace(tzinfo=timezone.utc) if r.entry_ts_effective.tzinfo is None else r.entry_ts_effective
         for r in valid_rows
     ]
     min_ts = min(all_ts)
@@ -124,7 +127,7 @@ def label_signals(
             if entry_price <= 0:
                 continue
 
-            entry_ts = row.computed_at
+            entry_ts = row.entry_ts_effective
             if entry_ts.tzinfo is None:
                 entry_ts = entry_ts.replace(tzinfo=timezone.utc)
             entry_ts = pd.Timestamp(entry_ts)
