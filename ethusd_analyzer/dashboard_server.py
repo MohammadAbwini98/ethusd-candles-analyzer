@@ -438,7 +438,7 @@ def _latest_signals(engine: Engine, schema: str, tf: str) -> dict:
     """)
     with engine.connect() as conn:
         row = conn.execute(sql, {"tf": tf}).mappings().first()
-    return dict(row) if row else {"timeframe": tf, "signal": "NONE", "reason": "no data yet"}
+    return dict(row) if row else {"timeframe": tf, "signal": "NONE", "reason": "No signal recommendation yet"}
 
 
 def _signal_history(engine: Engine, schema: str, tf: str, limit: int = 50) -> dict:
@@ -539,19 +539,23 @@ def _latest_candles(engine: Engine, schema: str, tf: str, limit: int = 200, befo
                 rows = conn.execute(sql, {"tf": tf, "lim": limit}).mappings().all()
         
         items = []
+        seen_times: set[int] = set()
         for r in reversed(list(rows)):
             ts = r["ts"]
             if hasattr(ts, "timestamp"):
                 epoch = int(ts.timestamp())
             else:
                 epoch = int(float(ts))
+            if epoch in seen_times:
+                continue
+            seen_times.add(epoch)
+            o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
+            v = float(r["vol"]) if r["vol"] is not None else 0.0
+            vals = [o, h, l, c]
             items.append({
                 "time": epoch,
-                "open": float(r["open"]),
-                "high": float(r["high"]),
-                "low": float(r["low"]),
-                "close": float(r["close"]),
-                "vol": float(r["vol"]) if r["vol"] is not None else 0.0,
+                "open": o, "high": max(vals), "low": min(vals), "close": c,
+                "vol": v,
             })
         return {"timeframe": tf, "items": items}
     except Exception as exc:

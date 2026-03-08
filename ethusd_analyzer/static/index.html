@@ -779,7 +779,7 @@
           <span class="pill" id="signalExpiry">--</span>
         </div>
         <div class="card-body" id="signalCard">
-          <div class="no-signal-msg" id="noSignalMsg">No signal data yet</div>
+          <div class="no-signal-msg" id="noSignalMsg">No active signal</div>
           <div id="signalContent" style="display:none">
             <div class="signal-hero">
               <span class="pill" id="regimePill">--</span>
@@ -1346,7 +1346,7 @@
     let _chartBars = [];          // mutable copy of last loaded bars
     let _chartTf = null;          // TF currently displayed
     let _chartLastBarTime = null; // epoch-seconds of the rightmost bar
-    let _chartLoadPending = false;
+    let _chartGen = 0;            // generation counter — races discard stale fetches
     let _chartIntervalId = null;
     let _lastChartTf = null;      // to detect TF change
     let _chartMode = "candles";
@@ -1365,33 +1365,45 @@
       "1Y": { "1m": 2000, "5m": 2000, "15m": 2000, "30m": 2000 }
     };
 
-    // LocalStorage cache utilities
-    function _getCacheKey(tf) {
-      return `ethusd_chart_${tf}`;
+    // Clear stale localStorage chart cache from prior versions
+    try { Object.keys(localStorage).filter(k => k.startsWith("ethusd_chart_")).forEach(k => localStorage.removeItem(k)); } catch (e) { }
+
+    /** Normalize bars: validate OHLC, sort ascending, deduplicate by time. */
+    function _normalizeBars(rawBars) {
+      if (!rawBars || !rawBars.length) return [];
+      let dropped = 0;
+      const valid = [];
+      for (const b of rawBars) {
+        if (b == null) { dropped++; continue; }
+        const t = Number(b.time), o = Number(b.open), h = Number(b.high), l = Number(b.low), c = Number(b.close);
+        if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) {
+          dropped++; continue;
+        }
+        const v = Number.isFinite(Number(b.vol)) && Number(b.vol) >= 0 ? Number(b.vol) : 0;
+        const vals = [o, h, l, c];
+        valid.push({ time: t, open: o, high: Math.max(...vals), low: Math.min(...vals), close: c, vol: v });
+      }
+      valid.sort((a, b) => a.time - b.time);
+      const map = new Map();
+      for (const bar of valid) map.set(bar.time, bar);
+      const result = Array.from(map.values());
+      result.sort((a, b) => a.time - b.time);
+      const dupes = valid.length - result.length;
+      if (dropped > 0 || dupes > 0) {
+        console.log(`[chart] normalize: ${rawBars.length} raw → ${result.length} clean (${dropped} invalid, ${dupes} dupes)`);
+      }
+      return result;
     }
 
-    function _saveToCache(tf, bars) {
-      try {
-        const key = _getCacheKey(tf);
-        localStorage.setItem(key, JSON.stringify({ tf, bars, ts: Date.now() }));
-      } catch (e) {
-        console.warn("[cache] save failed:", e);
-      }
-    }
-
-    function _loadFromCache(tf) {
-      try {
-        const key = _getCacheKey(tf);
-        const cached = localStorage.getItem(key);
-        if (!cached) return null;
-        const data = JSON.parse(cached);
-        // Cache valid for 5 minutes
-        if (Date.now() - data.ts > 300000) return null;
-        return data.bars;
-      } catch (e) {
-        console.warn("[cache] load failed:", e);
-        return null;
-      }
+    /** Apply bar data to all three series at once. */
+    function _applyBarsToSeries(bars) {
+      if (!_candleSeries) return;
+      _candleSeries.setData(bars);
+      _lineSeries.setData(bars.map(b => ({ time: b.time, value: b.close })));
+      _volSeries.setData(bars.map(b => ({
+        time: b.time, value: b.vol,
+        color: b.close >= b.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
+      })));
     }
 
     function _updateTfControls(tf) {
@@ -1458,7 +1470,7 @@
         lineWidth: 2,
         visible: false,
       });
-      _lwChart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+      _lwChart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.87, bottom: 0 } });
 
       _lwChart.subscribeCrosshairMove(param => {
         if (!param || param.time === undefined) {
@@ -1495,30 +1507,20 @@
 
     // Load more historical bars when scrolling left
     async function _loadMoreHistory() {
-      if (_isLoadingMore || !_canLoadMore || !_chartBars.length) return;
+      if (_isLoadingMore || !_canLoadMore || !_chartBars.length || !_chartTf) return;
       _isLoadingMore = true;
 
       try {
         const oldestTime = _chartBars[0].time;
-        const limit = 500;
-        const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(_chartTf)}&limit=${limit}&before=${oldestTime}`);
-        const newBars = (data.items || []).filter(b => b.open != null && b.time != null && b.time < oldestTime);
+        const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(_chartTf)}&limit=500&before=${oldestTime}`);
+        const newBars = _normalizeBars(data.items || []).filter(b => b.time < oldestTime);
 
         if (newBars.length > 0) {
-          // Prepend new bars
-          _chartBars = [...newBars, ..._chartBars];
-
-          // Update series with all bars
-          _candleSeries.setData(_chartBars);
-          _lineSeries.setData(_chartBars.map(b => ({ time: b.time, value: b.close })));
-          _volSeries.setData(_chartBars.map(b => ({
-            time: b.time, value: b.vol,
-            color: b.close >= b.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
-          })));
-
-          console.log(`[chart] lazy-loaded ${newBars.length} older bars`);
+          _chartBars = _normalizeBars([...newBars, ..._chartBars]);
+          _applyBarsToSeries(_chartBars);
+          console.log(`[chart] lazy-loaded ${newBars.length} older bars (total: ${_chartBars.length})`);
         } else {
-          _canLoadMore = false; // No more data available
+          _canLoadMore = false;
           console.log("[chart] no more historical data");
         }
       } catch (e) {
@@ -1546,61 +1548,63 @@
     }
 
     // Full bar reload – only runs on TF change or every 30 s
-    async function loadChartBars(tf, range = _chartRange, useCache = true) {
-      if (_chartLoadPending) return;
-      _chartLoadPending = true;
+    async function loadChartBars(tf, range = _chartRange) {
+      const gen = ++_chartGen;  // stamp this load; stale fetches will be discarded
       try {
         _initChart();
+        if (!_lwChart) return;
 
-        // Try cache first
-        let bars = null;
-        if (useCache) {
-          bars = _loadFromCache(tf);
-          if (bars && bars.length) {
-            console.log(`[chart] loaded ${bars.length} bars from cache`);
-          }
-        }
+        const limit = RANGE_TO_BARS[range]?.[tf] || 500;
+        const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(tf)}&limit=${limit}`);
 
-        // Fetch from API if no cache
-        if (!bars || !bars.length) {
-          const limit = RANGE_TO_BARS[range]?.[tf] || 500;
-          const data = await fetchJson(`/api/candles?tf=${encodeURIComponent(tf)}&limit=${limit}`);
-          bars = (data.items || []).filter(b => b.open != null && b.time != null);
-          _saveToCache(tf, bars);
-        }
+        // Abort if a newer load was started while we were fetching
+        if (gen !== _chartGen) return;
 
-        if (bars.length) {
-          _chartBars = bars.map(b => ({ ...b }));
+        const bars = _normalizeBars(data.items || []);
+        if (bars.length > 0) {
+          const first = bars[0], last = bars[bars.length - 1];
+          console.log(`[chart] loaded ${bars.length} bars for ${tf} [${new Date(first.time * 1000).toISOString()} → ${new Date(last.time * 1000).toISOString()}]`);
+          _chartBars = bars;
           _chartTf = tf;
           _chartRange = range;
-          _chartLastBarTime = bars[bars.length - 1].time;
-          _canLoadMore = bars.length >= 100; // Enable lazy load if we have enough bars
+          _chartLastBarTime = last.time;
+          _canLoadMore = bars.length >= 50;
 
-          _candleSeries.setData(bars);
-          _lineSeries.setData(bars.map(b => ({ time: b.time, value: b.close })));
-          _volSeries.setData(bars.map(b => ({
-            time: b.time, value: b.vol,
-            color: b.close >= b.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
-          })));
+          _applyBarsToSeries(bars);
           _lwChart.timeScale().fitContent();
           _updateTfControls(tf);
           _updateRangeControls(range);
-          _setOhlcDisplay(bars[bars.length - 1]);
+          _setOhlcDisplay(last);
+        } else {
+          // Clear chart for empty dataset
+          _chartBars = [];
+          _chartTf = tf;
+          _chartLastBarTime = null;
+          _canLoadMore = false;
+          _applyBarsToSeries([]);
+          _updateTfControls(tf);
+          _updateRangeControls(range);
+          _setOhlcDisplay(null);
         }
       } catch (e) { console.warn("[chart] loadChartBars:", e); }
-      finally { _chartLoadPending = false; }
     }
 
-    // Called every 1 s – updates the last/current bar close in-place (no flickering)
+    // Called every 1 s – updates the last/current bar close in-place (no flickering).
+    // Uses server-aligned timestamps (_chartLastBarTime + tfSecs) to avoid
+    // client-vs-server bar boundary mismatches that cause duplicate bars on reload.
     function pushLiveTick(price, tf) {
       if (!_candleSeries || !_chartLastBarTime || _chartTf !== tf) return;
       const tfSecs = TF_SECS[tf] || 60;
       const nowSec = Math.floor(Date.now() / 1000);
-      const curBarTime = Math.floor(nowSec / tfSecs) * tfSecs;
+      const elapsed = nowSec - _chartLastBarTime;
       const prev = _chartBars.length ? _chartBars[_chartBars.length - 1] : null;
       if (!prev) return;
-      if (curBarTime > _chartLastBarTime) {
-        // New bar opened – add placeholder; full reload picks it up within 30 s
+
+      if (elapsed >= tfSecs) {
+        // New bar: align to the server's bar grid (last bar time + interval)
+        const curBarTime = _chartLastBarTime + tfSecs;
+        // Safety: don't create bars too far ahead (> 2 intervals from last known bar)
+        if (nowSec - curBarTime > tfSecs * 2) return;
         const nb = { time: curBarTime, open: price, high: price, low: price, close: price, vol: 0 };
         _chartBars.push(nb);
         _chartLastBarTime = curBarTime;
@@ -1612,10 +1616,10 @@
         prev.high = Math.max(prev.high, price);
         prev.low = Math.min(prev.low, price);
         prev.close = price;
-        _candleSeries.update({ time: _chartLastBarTime, open: prev.open, high: prev.high, low: prev.low, close: price });
-        _lineSeries.update({ time: _chartLastBarTime, value: price });
+        _candleSeries.update({ time: prev.time, open: prev.open, high: prev.high, low: prev.low, close: price });
+        _lineSeries.update({ time: prev.time, value: price });
         _volSeries.update({
-          time: _chartLastBarTime, value: prev.vol,
+          time: prev.time, value: prev.vol,
           color: price >= prev.open ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"
         });
         _setOhlcDisplay(prev);
@@ -1626,10 +1630,17 @@
     function scheduleChartRefresh(tf) {
       if (tf !== _lastChartTf) {
         _lastChartTf = tf;
+        // Clear stale data from previous TF immediately
+        if (_chartBars.length && _chartTf !== tf) {
+          _chartBars = [];
+          _chartLastBarTime = null;
+          _canLoadMore = true;
+          if (_candleSeries) _applyBarsToSeries([]);
+        }
         _updateTfControls(tf);
         loadChartBars(tf, _chartRange);
         if (_chartIntervalId) clearInterval(_chartIntervalId);
-        _chartIntervalId = setInterval(() => loadChartBars(tf, _chartRange), 30000);
+        _chartIntervalId = setInterval(() => loadChartBars(_lastChartTf, _chartRange), 30000);
       }
     }
 
@@ -1703,7 +1714,7 @@
         const range = btn.dataset.range;
         if (!range || range === _chartRange) return;
         _chartRange = range;
-        loadChartBars(_chartTf || tfEl.value, range, false); // Force fresh load for new range
+        loadChartBars(_chartTf || tfEl.value, range);
       });
     });
 

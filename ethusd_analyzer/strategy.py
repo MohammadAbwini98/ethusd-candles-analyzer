@@ -119,13 +119,22 @@ def detect_regime(
     r_min: float = 0.10,
     a_min: float = 0.10,
 ) -> Regime:
-    # Check rc and ar independently — NaN in one doesn't block the other
     rc_ok = not np.isnan(rc)
     ar_ok = not np.isnan(ar)
-    if rc_ok and rc < -r_min:
+
+    # Negative rc => the signal behaves contrarian => mean reversion
+    if rc_ok and rc <= -r_min:
         return Regime.MR
-    if ar_ok and ar > a_min:
+
+    # Positive rc => the signal is aligning with returns => momentum
+    # This is the missing quadrant currently killing many 5m cases.
+    if rc_ok and rc >= r_min:
         return Regime.MOM
+
+    # Fallback: return autocorrelation can still identify trend regime
+    if ar_ok and ar >= a_min:
+        return Regime.MOM
+
     return Regime.NO_TRADE
 
 
